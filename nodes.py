@@ -40,6 +40,7 @@ class Qwen3_VQA:
                         "Qwen3-VL-4B-Thinking",
                         "Qwen3-VL-8B-Instruct",
                         "Qwen3-VL-8B-Thinking",
+                        "Huihui-Qwen3-VL-8B-Instruct-abliterated",
                     ],
                     {"default": "Qwen3-VL-4B-Instruct-FP8"},
                 ),
@@ -107,7 +108,10 @@ class Qwen3_VQA:
     ):
         if seed != -1:
             torch.manual_seed(seed)
-        model_id = f"qwen/{model}"
+        if model == "Huihui-Qwen3-VL-8B-Instruct-abliterated":
+            model_id = "huihui-ai/Huihui-Q3-VL-8B-Instruct-abliterated"
+        else:
+            model_id = f"qwen/{model}"
         self.model_checkpoint = os.path.join(
             folder_paths.models_dir, "prompt_generator", os.path.basename(model_id)
         )
