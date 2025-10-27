@@ -13,7 +13,7 @@ My favorite girl
 更新支持破限版模型：huihui-ai/Huihui-Qwen3-VL-8B-Instruct-abliterated
 支持NSFW
 模型下载地址：https://hf-mirror.com/huihui-ai/Huihui-Qwen3-VL-8B-Instruct-abliterated
-
+网盘地址：https://pan.quark.cn/s/3c8a51a41dd4
 
 # Comfyui_Qwen3-VL-Instruct
 
