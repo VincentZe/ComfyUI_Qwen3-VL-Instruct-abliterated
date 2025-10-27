@@ -109,7 +109,7 @@ class Qwen3_VQA:
         if seed != -1:
             torch.manual_seed(seed)
         if model == "Huihui-Qwen3-VL-8B-Instruct-abliterated":
-            model_id = "huihui-ai/Huihui-Q3-VL-8B-Instruct-abliterated"
+            model_id = "huihui-ai/Huihui-Qwen3-VL-8B-Instruct-abliterated"
         else:
             model_id = f"qwen/{model}"
         self.model_checkpoint = os.path.join(
