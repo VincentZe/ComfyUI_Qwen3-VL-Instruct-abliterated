@@ -27,21 +27,17 @@ class Qwen3_VQA:
 
     @classmethod
     def INPUT_TYPES(s):
+        # 遍历prompt_generator目录下的所有模型，如果模型名包含Qwen3-VL，则添加到model_list中
+        model_list = []
+        prompt_generator_dir = os.path.join(folder_paths.models_dir, "prompt_generator")
+        for model in os.listdir(prompt_generator_dir):
+            if "Qwen3-VL" in model:
+                model_list.append(model)
         return {
             "required": {
                 "text": ("STRING", {"default": "", "multiline": True}),
                 "model": (
-                    [
-                        "Qwen3-VL-4B-Instruct-FP8",
-                        "Qwen3-VL-4B-Thinking-FP8",
-                        "Qwen3-VL-8B-Instruct-FP8",
-                        "Qwen3-VL-8B-Thinking-FP8",
-                        "Qwen3-VL-4B-Instruct",
-                        "Qwen3-VL-4B-Thinking",
-                        "Qwen3-VL-8B-Instruct",
-                        "Qwen3-VL-8B-Thinking",
-                        "Huihui-Qwen3-VL-8B-Instruct-abliterated",
-                    ],
+                    model_list,
                     {"default": "Qwen3-VL-4B-Instruct-FP8"},
                 ),
                 "quantization": (
@@ -108,8 +104,9 @@ class Qwen3_VQA:
     ):
         if seed != -1:
             torch.manual_seed(seed)
-        if model == "Huihui-Qwen3-VL-8B-Instruct-abliterated":
-            model_id = "huihui-ai/Huihui-Qwen3-VL-8B-Instruct-abliterated"
+        # 如果model名以abliterated结尾，则使用abliterated模型
+        if "abliterated" in model:
+            model_id = f"huihui-ai/{model}"
         else:
             model_id = f"qwen/{model}"
         self.model_checkpoint = os.path.join(
