@@ -1,4 +1,4 @@
-from .nodes import Qwen3_VQA
+from .nodes import Qwen3_VQA, Qwen3_VL_BatchCache
 from .util_nodes import ImageLoader, VideoLoader, VideoLoaderPath
 from .path_nodes import MultiplePathsInput
 
@@ -7,6 +7,7 @@ WEB_DIRECTORY = "./web"
 # NOTE: names should be globally unique
 NODE_CLASS_MAPPINGS = {
     "Qwen3_VQA": Qwen3_VQA,
+    "Qwen3_VL_BatchCache": Qwen3_VL_BatchCache,
     "ImageLoader": ImageLoader,
     "VideoLoader": VideoLoader,
     "VideoLoaderPath": VideoLoaderPath,
@@ -16,6 +17,7 @@ NODE_CLASS_MAPPINGS = {
 # A dictionary that contains the friendly/humanly readable titles for the nodes
 NODE_DISPLAY_NAME_MAPPINGS = {
     "Qwen3_VQA": "Qwen3 VQA",
+    "Qwen3_VL_BatchCache": "Qwen3-VL Batch Cache (目录批量生缓存)",
     "ImageLoader": "Load Image Advanced",
     "VideoLoader": "Load Video Advanced",
     "VideoLoaderPath": "Load Video Advanced (Path)",
