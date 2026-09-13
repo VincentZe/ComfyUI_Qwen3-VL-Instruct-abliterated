@@ -248,12 +248,40 @@ asyncio.run(main())
 print('\n=== 5. 节点注册与注意力选项 ===')
 chk('批量节点已注册', hasattr(nodes, 'Qwen3_VL_BatchCache'))
 chk('批量节点有 directory 参数', 'directory' in nodes.Qwen3_VL_BatchCache.INPUT_TYPES()['required'])
-chk('模型列表 9 项', len(nodes.MODEL_CHOICES) == 9)
+chk('内置兜底模型列表 9 项', len(nodes.MODEL_CHOICES) == 9)
 chk('attention 选项含 sage', 'sage' in nodes.ATTENTION_CHOICES, str(nodes.ATTENTION_CHOICES))
 chk('attention 默认值仍是 eager', nodes.ATTENTION_CHOICES[0] == 'eager')
 chk('sage 已在 transformers 侧注册成功', nodes._SAGE_REGISTERED is True)
 chk('两个节点的 attention 选项一致',
     nodes.Qwen3_VL_BatchCache.INPUT_TYPES()['required']['attention'][0] == nodes.ATTENTION_CHOICES)
+
+# 上游 f1061fe 把 model 下拉从硬编码列表改成"动态扫描 models/prompt_generator"。
+# 这里实测 scan_model_choices()：存在目录时只挑名字含 Qwen3-VL 的，不存在时回退内置列表。
+print('  -- scan_model_choices（动态模型下拉）--')
+_root = tempfile.mkdtemp(prefix='qvqa_models_')
+_pg = os.path.join(_root, 'prompt_generator')
+os.makedirs(_pg)
+for _n in ('Qwen3-VL-4B-Instruct-FP8', 'Qwen3-VL-8B-Thinking', 'some-other-model', 'readme.txt'):
+    open(os.path.join(_pg, _n), 'w').close()
+_saved_models_dir = nodes.folder_paths.models_dir
+try:
+    nodes.folder_paths.models_dir = _root
+    _scanned = nodes.scan_model_choices()
+    chk('动态扫描只挑名字含 Qwen3-VL 的条目',
+        sorted(_scanned) == ['Qwen3-VL-4B-Instruct-FP8', 'Qwen3-VL-8B-Thinking'], str(_scanned))
+    chk('两个节点的 model 下拉都走同一个扫描函数',
+        nodes.Qwen3_VQA.INPUT_TYPES()['required']['model'][0] == _scanned
+        and nodes.Qwen3_VL_BatchCache.INPUT_TYPES()['required']['model'][0] == _scanned)
+finally:
+    nodes.folder_paths.models_dir = _saved_models_dir
+    shutil.rmtree(_root, ignore_errors=True)
+
+try:
+    nodes.folder_paths.models_dir = os.path.join(tempfile.gettempdir(), 'qvqa_no_such_dir_xyz')
+    chk('model 目录不存在 → 回退内置列表（不能让 INPUT_TYPES 抛异常）',
+        nodes.scan_model_choices() == nodes.MODEL_CHOICES)
+finally:
+    nodes.folder_paths.models_dir = _saved_models_dir
 
 # ============================================== 6. 加载参数变化必须触发重载
 # ComfyUI 会缓存节点实例（execution.py: caches.objects.get(unique_id)），

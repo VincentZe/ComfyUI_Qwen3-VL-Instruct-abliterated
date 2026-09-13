@@ -63,6 +63,28 @@ MODEL_CHOICES = [
     "Qwen3-VL-8B-Thinking",
     "Huihui-Qwen3-VL-8B-Instruct-abliterated",
 ]
+# 注意：上面这个列表现在只是**兜底**。上游（f1061fe）把模型下拉改成了动态扫描
+# models/prompt_generator 下名字含 "Qwen3-VL" 的目录，所以真正生效的是下面这个函数。
+# 两个节点（Qwen3_VQA / Qwen3_VL_BatchCache）都用它，保证下拉一致。
+
+
+def scan_model_choices():
+    """动态扫描 models/prompt_generator 下名字含 "Qwen3-VL" 的目录（上游行为）。
+
+    包一层 try/except + 兜底的理由：`os.listdir` 在目录不存在时会抛
+    FileNotFoundError，而 INPUT_TYPES 抛异常会让**整个节点注册失败**
+    （用户没建 prompt_generator 目录就再也看不到节点了）。
+    扫描为空时也回退——否则下拉变成空列表，ComfyUI 会直接报错。
+    """
+    try:
+        prompt_generator_dir = os.path.join(folder_paths.models_dir, "prompt_generator")
+        names = [n for n in os.listdir(prompt_generator_dir) if "Qwen3-VL" in n]
+    except Exception as e:
+        print(f"[Qwen3_VQA] 扫描 prompt_generator 目录失败，回退到内置模型列表：{e!r}")
+        names = []
+    return names or list(MODEL_CHOICES)
+
+
 # eager 仍是第一项（新节点的默认值不变）；sage 由 sage_attention.py 注册，不满足条件会退回 sdpa。
 # 注意：本机没装 flash_attn，选 flash_attention_2 会直接报错。
 ATTENTION_CHOICES = ["eager", "sage", "sdpa", "flash_attention_2"]
@@ -277,7 +299,7 @@ class Qwen3_VQA:
             "required": {
                 "text": ("STRING", {"default": "", "multiline": True}),
                 "model": (
-                    MODEL_CHOICES,
+                    scan_model_choices(),
                     {"default": "Qwen3-VL-4B-Instruct-FP8"},
                 ),
                 "quantization": (
@@ -353,8 +375,9 @@ class Qwen3_VQA:
                 return (hit.get("output", ""),)
         if seed != -1:
             torch.manual_seed(seed)
-        if model == "Huihui-Qwen3-VL-8B-Instruct-abliterated":
-            model_id = "huihui-ai/Huihui-Qwen3-VL-8B-Instruct-abliterated"
+        # 如果model名以abliterated结尾，则使用abliterated模型
+        if "abliterated" in model:
+            model_id = f"huihui-ai/{model}"
         else:
             model_id = f"qwen/{model}"
         self.model_checkpoint = os.path.join(
@@ -550,7 +573,7 @@ class Qwen3_VL_BatchCache:
             "required": {
                 "directory": ("STRING", {"default": ""}),
                 "text": ("STRING", {"default": "", "multiline": True}),
-                "model": (MODEL_CHOICES, {"default": "Qwen3-VL-4B-Instruct-FP8"}),
+                "model": (scan_model_choices(), {"default": "Qwen3-VL-4B-Instruct-FP8"}),
                 "quantization": (["none", "4bit", "8bit"], {"default": "none"}),
                 "attention": (ATTENTION_CHOICES,),
                 "recursive": ("BOOLEAN", {"default": False}),
