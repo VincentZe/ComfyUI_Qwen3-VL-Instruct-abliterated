@@ -85,7 +85,10 @@ def scan_model_choices():
     return names or list(MODEL_CHOICES)
 
 
-# eager 仍是第一项（新节点的默认值不变）；sage 由 sage_attention.py 注册，不满足条件会退回 sdpa。
+# eager 仍是第一项（新节点的默认值不变）。
+# sage 由 sage_attention.py 注册，是**严格模式**：选了 sage 就一定走 sage，用不了会直接报错
+# （不会静默退回 sdpa——那样测出来的成绩是假的）。比如没装 sageattention、或输入里有 padding，
+# 都会抛出带指引的错误。
 # 注意：本机没装 flash_attn，选 flash_attention_2 会直接报错。
 ATTENTION_CHOICES = ["eager", "sage", "sdpa", "flash_attention_2"]
 
@@ -375,6 +378,20 @@ class Qwen3_VQA:
                 return (hit.get("output", ""),)
         if seed != -1:
             torch.manual_seed(seed)
+
+        # attention=sage 是严格模式：用不了就直接报错，绝不静默退回 sdpa。
+        # 所以在下载/加载模型之前先确认 sageattention 真的在，避免白等几分钟才炸。
+        # 这里直接 try import，不走 sageattn_available() 的缓存（用户可能中途才装上）。
+        if attention == "sage":
+            try:
+                import sageattention  # noqa: F401
+            except Exception as e:
+                raise RuntimeError(
+                    "[Qwen3_VQA] attention=sage 需要 sageattention，但当前环境没有安装。\n"
+                    "  请执行：pip install sageattention\n"
+                    "  或者把节点的 attention 改成 sdpa / eager。"
+                ) from e
+
         # 如果model名以abliterated结尾，则使用abliterated模型
         if "abliterated" in model:
             model_id = f"huihui-ai/{model}"

@@ -3,66 +3,102 @@
 transformers 的 `ALL_ATTENTION_FUNCTIONS` 里没有 sage，所以这里自己注册一个名字叫 "sage"
 的注意力实现，然后节点就可以直接 `attn_implementation="sage"`。
 
-策略是"能走就走、不能走就退"：
-- 走 sageattn：CUDA + fp16/bf16 + causal + 没有 attention_mask + q_len 够长 + head_dim 对齐
-- 其余一律退回 transformers 自带的 sdpa，保证任何情况下都不会跑坏
+设计原则：**选了什么就用什么，用不了就报错。**
+--------------------------------------------
+早期版本会在各种条件下静默退回 sdpa。那个设计有个致命缺陷：用户在节点上选了 `sage`，
+实际跑的可能是 sdpa，**测出来的成绩是假的**（日志里也看不出来）。所以现在取消所有静默回退，
+把"用不了"的情况变成显式异常，绝不偷偷换实现。
 
-典型情况：
-- 预填充（图片/提示词那一次前向）：无 mask、causal、q_len 够长 → **走 sage**
-- 逐 token 解码：有 4D mask → 退回 sdpa（sage 对 q_len=1 本来也不划算）
-- 视觉塔：显式 is_causal=False → 退回 sdpa
+sageattn 的能力边界（本机 sageattention + sm120 实测）
+----------------------------------------------------
+能做的：
+- GQA 原生支持（要求 num_qo_heads % num_kv_heads == 0），无需手动 repeat_kv
+- `is_causal=True/False` 都支持；`is_causal` 仅在 qo_len == kv_len 时有效
+- `sm_scale` 可传任意值（所以不需要再校验缩放是否等于 head_dim**-0.5）
+- head_dim 无 64 倍数限制（D=64/96/100 实测均可）
+- 非连续输入可以吃
+不能做的（→ 抛 SageAttentionUnsupported）：
+- **任意 attention_mask**：API 里根本没有 mask 参数
+- dtype 非 fp16/bf16（fp32 会 AssertionError）
+- 不在 CUDA 上 / dropout > 0
+- 1 < q_len < kv_len（需要"带偏移的因果掩码"，sageattn 表达不了）
 
-关于 MIN_Q_LEN（重要）
----------------------
-sage 是 int8/fp8 量化内核，量化本身有固定开销；序列太短时这个开销吃不掉收益，
-反而比 torch 自带的 sdpa 慢。本机（RTX 5090 / sm120 / torch 2.9.1+cu130）实测
-单次 MHA、fp16、D=128、causal：
+为什么现在连**解码**也走 sage
+------------------------------
+旧版本注释说"逐 token 解码有 4D mask，所以退回 sdpa"。实测这是错的：
+transformers 的 `_ignore_causal_mask_sdpa()` 在"无 padding 且 (q_len == 1 或 kv_len == q_len)"
+时会直接把 mask 优化成 `None`（masking_utils.py:219-262）。真实模型一次生成的调用形态实测为：
 
-    S        sage           sdpa          加速比
-    512      0.21 ms        0.10 ms       0.29x       稳亏
-    1024     0.22 ms        0.10 ms       0.46x       稳亏
-    1536     0.24~0.39 ms   0.16~0.19 ms  0.48~0.65x  稳亏
-    2048     0.26 ms        0.25 ms       0.91~0.99x  持平
-    2560     0.28~0.39 ms   0.34 ms       0.89~1.32x  不稳（出现过亏本轮次）
-    3072     0.32 ms        0.43 ms       1.36~1.52x  稳赚
-    4096     0.38~0.52 ms   0.69 ms       1.33~1.83x  稳赚
-    8192     0.52 ms        2.35 ms       4.55x       稳赚
+    层             q_len   kv_len   mask   is_causal   次数
+    视觉塔          3844    3844    None   False        27     ← 双向
+    文本预填充       972     972    None   None(=causal) 36
+    文本解码           1     973+   None   None         36/token
 
-注意本机后台常驻 LDPlayer 模拟器、浏览器、NVIDIA Overlay（约 4.2 GB 显存），
-sage 单次只有 0.2~0.5 ms，实测耗时呈双峰波动；sdpa 侧则很稳定。所以阈值取的是
-**第一档"每个轮次都赚钱"的长度**，而不是平均交叉点——即 3072，而不是 2048~2560。
+**全程没有一个 mask**。所以解码也能走 sage：q_len==1 时用 `is_causal=False`，
+单个查询看到全部 key，这正是因果解码的语义。
 
-另一点：这还只是热循环单算子，真实前向额外要做一次 GQA 的 repeat_kv 拷贝
-（8→32 头，2048×128 fp16 约 16MB，≈11us），实际只会更偏保守。
+关于 mask 生成器的注册（必须保留）
+----------------------------------
+除了 `AttentionInterface`，还必须把 `ALL_MASK_ATTENTION_FUNCTIONS["sage"]` 也注册成
+`sdpa_mask`。原因是 masking_utils.py:718：
 
-因此：
-- 单图 VQA（默认 max_pixels=1280*28*28 → 约 1280 视觉词元）→ **不要用 sage，会慢 2~3 倍**
-- 视频 / 多图 / 超长提示词（>3k 词元）→ sage 才有意义
-- 阈值只在 2048~3072 这个窄区间影响结果，那里 sage 本来也就 1.0~1.4x，摊到整个
-  8B 模型前向里更是微乎其微，所以宁可取保守值
+    if config._attn_implementation not in ALL_MASK_ATTENTION_FUNCTIONS._global_mapping:
+        return None      # ← 连 padding mask 一起丢掉
 
-想调整就设环境变量：
+不注册的话，带 padding 的输入会被**静默**当成没有 padding（结果是静默算错）。
+注册 sdpa_mask 后：
+- 无 padding：mask 仍为 None（`_ignore_causal_mask_sdpa` 会跳过）→ sage 正常生效
+- 有 padding：生成真的 4D mask → 我们的实现见到 mask 就**抛错**，而不是算错
 
-    QWEN3_VL_SAGE_MIN_Q_LEN=0      强制尽量走 sage（短序列会明显变慢）
-    QWEN3_VL_SAGE_MIN_Q_LEN=8192   只在超长上下文才用
+也就是说注册它既让 sage 能生效，又给 padding 加了一道"响"的保险。
+
+实测（同环境成绩表）
+--------------------
+本机 RTX 5090 / torch 2.9.1+cu130 / bf16 / 真实 Qwen3-VL 头数（Hq=32, Hkv=8, D=128）。
+同一进程、同一份权重，三种 attention 交错 3 轮取中位数；greedy 强制生成 100 token
+（必须用 min_new_tokens 防早停，否则贪心撞 EOS 会让"每 token 耗时"算得离谱）。
+
+单图端到端（大图：输入 974 词元 / 961 视觉词元）：
+
+    attn     预填充     解码/token   生成100tok总时
+    eager    341.8ms    45.87ms      4928ms      ← 节点默认值
+    sdpa     264.0ms    39.59ms      4223ms
+    sage     170.6ms    38.39ms      4010ms      ← 三者最快
+
+同一次生成里注意力函数自身的累计耗时（ms）：
+
+    attn     视觉塔    文本预填充   文本解码    合计
+    eager    159.5      29.7       816.7    1005.8
+    sdpa      44.0      59.7       865.8     969.5
+    sage      21.3       5.2       581.3     607.8
+
+小图（输入 374 词元 / 361 视觉词元）：sage 预填充 89.8ms ≈ eager 107.1ms < sdpa 96.5ms；
+注意力合计 sage 589.1 < eager 678.1 < sdpa 1040.4。
+
+结论：**sage 在三个阶段（视觉塔 / 预填充 / 解码）全面最快，短上下文也不亏**。
+所以 MIN_Q_LEN 那道门槛已删除（旧表说"1024 长度稳亏"，与实测不符）。
+
+顺带发现：eager 拿到的是一张真的 4D mask（文本预填充和文本解码都拿），
+而 sdpa/sage 走 `_ignore_causal_mask_sdpa` 直接拿到 None。这既省了建 mask 的开销，
+也是 sage 能生效的前提。
 """
-
-import os
 
 import torch
 
-from transformers.integrations.sdpa_attention import repeat_kv, sdpa_attention_forward
 from transformers.modeling_utils import AttentionInterface
 
 NAME = "sage"
 
-# 序列短于这个长度就不走 sage（见文件头实测表）。可用环境变量覆盖。
-MIN_Q_LEN = int(os.environ.get("QWEN3_VL_SAGE_MIN_Q_LEN", "3072"))
-HEAD_DIM_MULTIPLE = 64  # sage 对 head_dim 有对齐要求（Qwen3-VL 是 128，满足）
-
 _available = None  # None=还没探测过
-_warned_runtime = False
 _warned_missing = False
+
+
+class SageAttentionUnsupported(RuntimeError):
+    """选了 sage 但这次的调用形态 sageattn 表达不了。
+
+    不是"退回 sdpa 的理由"，而是"必须让用户知道的错误"：
+    要么改选 sdpa / eager，要么改掉触发这个形态的输入。
+    """
 
 
 def sageattn_available() -> bool:
@@ -76,21 +112,14 @@ def sageattn_available() -> bool:
             _available = False
             if not _warned_missing:
                 _warned_missing = True
-                print(f"[Qwen3_VL] 未检测到 sageattention，attention=sage 会全部退回 sdpa：{e}")
+                print(f"[Qwen3_VL] 未检测到 sageattention，attention=sage 会在前向时报错：{e}")
     return _available
 
 
-def _fallback(module, query, key, value, attention_mask, dropout, scaling, is_causal, kwargs):
-    return sdpa_attention_forward(
-        module,
-        query,
-        key,
-        value,
-        attention_mask,
-        dropout=dropout,
-        scaling=scaling,
-        is_causal=is_causal,
-        **kwargs,
+def _unsupported(why: str, hint: str = "") -> "SageAttentionUnsupported":
+    return SageAttentionUnsupported(
+        f"[Qwen3_VL] attention=sage 无法处理本次调用：{why}。{hint}"
+        f"（本插件不再静默退回 sdpa；要避免此错误请把节点的 attention 改成 sdpa 或 eager）"
     )
 
 
@@ -105,82 +134,81 @@ def sage_attention_forward(
     is_causal=None,
     **kwargs,
 ):
-    """签名和 transformers 的 sdpa_attention_forward 保持一致。"""
-    global _warned_runtime
+    """签名与 transformers 的 sdpa_attention_forward 保持一致，返回 (output, None)。"""
+    q_len = int(query.shape[2])
+    kv_len = int(key.shape[2])
+    n_q_heads = int(query.shape[1])
+    n_kv_heads = int(key.shape[1])
 
-    # 和 sdpa 一样的 mask 裁剪逻辑，保证退路行为完全一致
-    if attention_mask is not None and attention_mask.ndim == 4:
-        attention_mask = attention_mask[:, :, :, : key.shape[-2]]
+    # ---------- 前置校验：不满足一律报错，不做任何回退 ----------
+    if not sageattn_available():
+        raise _unsupported(
+            "没有安装 sageattention",
+            "请 pip install sageattention（或把 attention 改成 sdpa/eager）",
+        )
+    if torch.jit.is_tracing() or torch.compiler.is_compiling():
+        raise _unsupported(
+            "当前处于 tracing / torch.compile 过程中",
+            "sage 是自定义 kernel，无法被 trace；请改用 sdpa/eager，或关掉 torch.compile",
+        )
+    if attention_mask is not None:
+        raise _unsupported(
+            f"收到了 attention_mask（shape={tuple(attention_mask.shape)}），"
+            f"而 sageattn 没有 mask 入参",
+            "通常意味着输入里存在 padding（例如一个 batch 内序列不等长）；"
+            "请对等长输入逐个跑，或改用 sdpa/eager",
+        )
+    if dropout:
+        raise _unsupported(f"dropout={dropout}，sageattn 不支持 dropout")
+    if not query.is_cuda:
+        raise _unsupported(f"query 在 {query.device}，sageattn 只能在 CUDA 上跑")
+    if query.dtype not in (torch.float16, torch.bfloat16):
+        raise _unsupported(
+            f"dtype={query.dtype}，sageattn 只接受 fp16/bf16",
+            "如果是 fp32 权重，请用 dtype=float16/bfloat16 加载模型",
+        )
+    if n_kv_heads == 0 or n_q_heads % n_kv_heads:
+        raise _unsupported(
+            f"head 数不匹配（q={n_q_heads}, kv={n_kv_heads}），"
+            f"sageattn 要求 num_qo_heads 能被 num_kv_heads 整除"
+        )
 
+    # ---------- 决定 causal ----------
     if is_causal is None:
-        is_causal = (
-            query.shape[2] > 1
-            and attention_mask is None
-            and getattr(module, "is_causal", True)
+        is_causal = q_len > 1 and bool(getattr(module, "is_causal", True))
+
+    if q_len == kv_len:
+        use_causal = bool(is_causal)
+    elif q_len == 1:
+        # 单个 query 看全部 key —— 这正是因果解码语义，所以非 causal
+        use_causal = False
+    else:
+        raise _unsupported(
+            f"q_len={q_len} < kv_len={kv_len} 且 q_len>1，"
+            f"需要带位置偏移的因果掩码，sageattn 表达不了"
         )
 
-    def fb():
-        return _fallback(
-            module, query, key, value, attention_mask, dropout, scaling, is_causal, kwargs
-        )
+    # ---------- 跑 sageattn ----------
+    import sageattention
 
-    # ---- 决定走不走 sage ----
-    if not sageattn_available() or torch.jit.is_tracing():
-        return fb()
-    if attention_mask is not None or not is_causal or dropout:
-        return fb()
-    if not query.is_cuda or query.dtype not in (torch.float16, torch.bfloat16):
-        return fb()
-    if query.shape[2] < MIN_Q_LEN or query.shape[2] != key.shape[2]:
-        return fb()
-    if query.shape[-1] % HEAD_DIM_MULTIPLE:
-        return fb()
-    # sageattn 的默认缩放就是 head_dim**-0.5，别的缩放值不敢直接用，退回
-    if scaling is not None:
-        default_scale = query.shape[-1] ** -0.5
-        if abs(float(scaling) - default_scale) > 1e-6:
-            return fb()
-
-    try:
-        import sageattention
-
-        k, v = key, value
-        n_rep = getattr(module, "num_key_value_groups", 1) or 1
-        if n_rep > 1:  # sageattn 要求 q/k/v 头数一致，先做 GQA 扩展
-            k = repeat_kv(k, n_rep)
-            v = repeat_kv(v, n_rep)
-
-        out = sageattention.sageattn(
-            query,
-            k,
-            v,
-            tensor_layout="HND",
-            is_causal=True,
-            output_dtype=query.dtype,
-        )
-        if isinstance(out, (tuple, list)):
-            out = out[0]
-        return out.transpose(1, 2).contiguous(), None
-    except Exception as e:
-        if not _warned_runtime:
-            _warned_runtime = True
-            print(f"[Qwen3_VL] sageattn 调用失败，本次及后续退回 sdpa：{e}")
-        return fb()
+    out = sageattention.sageattn(
+        query,
+        key,
+        value,
+        tensor_layout="HND",
+        is_causal=use_causal,
+        sm_scale=scaling,       # None 时 sageattn 自己按 head_dim**-0.5 处理
+        output_dtype=query.dtype,
+    )
+    if isinstance(out, (tuple, list)):
+        out = out[0]
+    return out.transpose(1, 2).contiguous(), None
 
 
 def register() -> bool:
     """把 "sage" 注册进 transformers，失败不影响插件其它功能。
 
-    要注册两张表，缺第二张会算错（不是报错）：
-    1. `AttentionInterface`（注意力函数）—— 否则 `attn_implementation="sage"` 直接报错。
-    2. `ALL_MASK_ATTENTION_FUNCTIONS`（mask 生成器）—— transformers 用它来决定
-       "这个实现需不需要 4D 因果 mask"。我们的名字没在里面时它会走 early-exit
-       （masking_utils.py:718 `if config._attn_implementation not in ...: return None`），
-       于是**连 padding mask 一起被丢掉**。batch=1 时看不出问题（本来就没有 padding），
-       但一旦有 padding（多图拼 batch / 变长序列），padding 位会被当成正常 token 参与注意力，
-       结果是静默算错。挂上 sdpa 的 mask 生成器后：
-       - 无 padding 的预填充：mask 仍为 None（`_ignore_causal_mask_sdpa` 会跳过），sage 照常生效
-       - 有 padding：生成真的 4D mask → 我们的实现看到 mask 就退回 sdpa，结果与 sdpa 一致
+    要注册两张表，缺第二张会**静默算错**（见文件头"关于 mask 生成器的注册"）。
     """
     ok = True
     try:
@@ -194,6 +222,6 @@ def register() -> bool:
 
         ALL_MASK_ATTENTION_FUNCTIONS.register(NAME, sdpa_mask)
     except Exception as e:  # pragma: no cover - 取决于 transformers 版本
-        print(f"[Qwen3_VL] 注册 sage 的 mask 生成器失败（带 padding 的批量会算错，单图不受影响）：{e}")
+        print(f"[Qwen3_VL] 注册 sage 的 mask 生成器失败（带 padding 的输入会被静默算错）：{e}")
 
     return ok

@@ -44,6 +44,12 @@ tf.modeling_utils.AttentionInterface = type('AttentionInterface', (), {
     'valid_keys': lambda self: [],
 })
 
+# sageattention 也要打桩。nodes.py 在 attention=='sage' 时会在「下载/加载模型之前」
+# 先 try import 它（严格模式：用不了要立刻报错，而不是跑到前向才炸），
+# 这里 fake 的 torch 撑不起真的 sageattention，所以必须自己塞一个。
+# 想测「没装 sageattention 时该报错」的用例，把 sys.modules 里这条临时设成 None。
+mod('sageattention', sageattn=lambda *a, **k: None)
+
 mm = mod('comfy.model_management', get_torch_device=lambda: 'cpu',
          processing_interrupted=lambda: False)
 comfy = mod('comfy', model_management=mm)
@@ -381,6 +387,48 @@ _runner.inference(**{**_BASE, 'max_pixels': 4096 * 28 * 28, 'attention': 'sage',
                      'model': 'Qwen3-VL-8B-Instruct-FP8'})
 chk('换模型 → 触发重载', len(_load_calls) > _n, f'({len(_load_calls)} > {_n})')
 
+# ================================ 7. attention=sage 缺依赖必须提前报错
+# 严格模式：选了 sage 就要用 sage，用不了直接报错（不再静默退回 sdpa）。
+# 这一步必须在「下载/加载模型之前」发生，否则用户会白等几分钟才看到错。
+# 注意：本节必须跑在第 6 节那套假加载器 + 假 models_dir 还在的时候，
+# 否则对照用例会真的去 huggingface 下载模型。
+print('\n=== 7. attention=sage 但没装 sageattention → 提前报错 ===')
+_saved_sa = sys.modules.get('sageattention')
+sys.modules['sageattention'] = None      # 之后 import sageattention 会抛 ImportError
+try:
+    _n7 = len(_load_calls)
+    _bad = nodes.Qwen3_VQA()
+    try:
+        _bad.inference(**{**_BASE, 'attention': 'sage'})
+        chk('没装 sageattention 时 attention=sage → 抛错', False, '(居然没抛)')
+    except RuntimeError as e:
+        msg = str(e)
+        chk('没装 sageattention 时 attention=sage → 抛错 RuntimeError',
+            'sageattention' in msg)
+        chk('  └ 错误信息带安装指引', 'pip install sageattention' in msg)
+        chk('  └ 错误信息给出替代方案', 'sdpa' in msg and 'eager' in msg)
+        chk('  └ 加载前就拦住了（没有新增任何加载）', len(_load_calls) == _n7,
+            f'(新增 {len(_load_calls) - _n7} 次加载)')
+    except Exception as e:
+        chk('没装 sageattention 时 attention=sage → 抛错', False,
+            f'(抛了 {type(e).__name__}: {e!r})')
+
+    # 对照：attention 不是 sage 时，即使没有 sageattention 也不该被拦
+    _n7 = len(_load_calls)
+    try:
+        nodes.Qwen3_VQA().inference(**{**_BASE, 'attention': 'eager'})
+        chk('对照：attention=eager 时不检查 sageattention（照常加载）',
+            len(_load_calls) > _n7, f'(新增 {len(_load_calls) - _n7} 次加载)')
+    except Exception as e:
+        chk('对照：attention=eager 时不检查 sageattention（照常加载）', False,
+            f'({type(e).__name__}: {e})')
+finally:
+    if _saved_sa is None:
+        sys.modules.pop('sageattention', None)
+    else:
+        sys.modules['sageattention'] = _saved_sa
+
+# 收尾：还原 models_dir 并清掉临时目录
 _fp.models_dir = _old_models_dir
 shutil.rmtree(_models_root, ignore_errors=True)
 
