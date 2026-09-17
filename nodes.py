@@ -803,6 +803,18 @@ if _HAS_SERVER:
             "next_id": _next_id(image_path),
         })
 
+    @PromptServer.instance.routes.get("/qwen3_vqa/resolve_path")
+    async def vqa_resolve_path(request):
+        """把 Load Image Advanced / VideoLoader 的文件名解析成绝对路径。
+
+        给前端用：image_path 控件被转换成输入口后控件值是空的，
+        前端要在不运行工作流的情况下沿连线反推路径，
+        才能列出这张图已保存的 prompt（下拉栏）。"""
+        name = request.query.get("name", "").strip()
+        if not name:
+            return web.json_response({"error": "name is required"}, status=400)
+        return web.json_response({"path": folder_paths.get_annotated_filepath(name)})
+
     @PromptServer.instance.routes.get("/qwen3_vqa/batch/scan")
     async def vqa_batch_scan(request):
         """只读预扫描：统计目录里有多少图、多少张已有缓存，不写入任何东西。"""

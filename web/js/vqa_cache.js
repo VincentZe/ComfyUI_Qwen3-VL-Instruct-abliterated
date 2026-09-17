@@ -41,6 +41,59 @@ function clip(text, max = 28) {
     return t.length > max ? t.slice(0, max) + "…" : t;
 }
 
+// image_path 控件被转换成输入口后，控件值是空的（真值只在运行时才有）。
+// 要在不运行工作流的情况下刷新 prompt 下拉栏，就得沿连线反推路径：
+//   ImageLoader / VideoLoader：读 image/file 控件的文件名，让后端解析成绝对路径
+//   VideoLoaderPath：file 控件本身就是绝对路径
+//   MultiplePathsInput：恰好填了一条 path_N 时用那条
+//   中途的 Reroute / PrimitiveNode 会穿透
+async function resolveImagePath(node) {
+    const pathWidget = node.widgets?.find((w) => w.name === "image_path");
+    const manual = String(pathWidget?.value || "").trim();
+    if (manual) return manual;
+
+    let input = node.inputs?.find((i) => i && i.name === "image_path");
+    for (let hops = 0; hops < 10 && input; hops++) {
+        const link = input.link != null ? app.graph.links[input.link] : null;
+        if (!link) return "";
+        const origin = app.graph.getNodeById(link.origin_id);
+        if (!origin) return "";
+
+        if (origin.type === "ImageLoader" || origin.type === "VideoLoader") {
+            const w = origin.widgets?.find((x) =>
+                x.name === (origin.type === "ImageLoader" ? "image" : "file")
+            );
+            const name = String(w?.value || "").trim();
+            if (!name) return "";
+            const data = await fetchJson(
+                `/qwen3_vqa/resolve_path?name=${enc(name)}`
+            );
+            return String(data.path || "");
+        }
+        if (origin.type === "VideoLoaderPath") {
+            return String(
+                origin.widgets?.find((x) => x.name === "file")?.value || ""
+            ).trim();
+        }
+        if (origin.type === "MultiplePathsInput") {
+            const vals = (origin.widgets || [])
+                .filter((x) => /^path_\d+$/.test(x.name))
+                .map((x) => String(x.value || "").trim())
+                .filter(Boolean);
+            return vals.length === 1 ? vals[0] : "";
+        }
+        if (origin.type === "PrimitiveNode") {
+            return String(origin.widgets?.[0]?.value || "").trim();
+        }
+        if (origin.type === "Reroute") {
+            input = origin.inputs?.[0];
+            continue;
+        }
+        return ""; // 未知来源，解析不了
+    }
+    return "";
+}
+
 const STYLE_ID = "qwen3-vqa-cache-style";
 
 function ensureStyle() {
@@ -136,11 +189,13 @@ function labelFor(value, metaMap) {
     return sum ? `${value} · ${sum}` : value;
 }
 
-function openManager(node) {
-    const pathWidget = node.widgets?.find((w) => w.name === "image_path");
-    const imagePath = String(pathWidget?.value || "").trim();
+async function openManager(node) {
+    const imagePath = await resolveImagePath(node).catch(() => "");
     if (!imagePath) {
-        alert("请先在节点上填写 image_path（图片绝对路径）");
+        alert(
+            "无法确定图片路径：请手填 image_path，" +
+            "或把它连到 Load Image Advanced / VideoLoader 等节点并选好文件。"
+        );
         return;
     }
 
@@ -400,14 +455,28 @@ function registerVqaCache(nodeType) {
             versionWidget.options.getOptionLabel = (value) => labelFor(value, metaMap);
         }
 
-        const refresh = async () => {
-            const imagePath = String(pathWidget.value || "").trim();
+        function resetDropdown() {
+            metaMap.clear();
+            versionWidget.options.values = [NEW_VALUE];
+            applyLabelMapper();
+            if (versionWidget.value !== NEW_VALUE) versionWidget.value = NEW_VALUE;
+        }
 
-            if (!useCacheWidget?.value || !imagePath) {
-                metaMap.clear();
-                versionWidget.options.values = [NEW_VALUE];
-                applyLabelMapper();
-                if (versionWidget.value !== NEW_VALUE) versionWidget.value = NEW_VALUE;
+        const refresh = async () => {
+            if (!useCacheWidget?.value) {
+                resetDropdown();
+                return;
+            }
+
+            let imagePath = "";
+            try {
+                // 手填控件值，或沿连线反推（Load Image Advanced 等）
+                imagePath = await resolveImagePath(node);
+            } catch (e) {
+                console.warn("[Qwen3_VQA] resolve image_path failed", e);
+            }
+            if (!imagePath) {
+                resetDropdown();
                 return;
             }
 
@@ -488,6 +557,38 @@ function registerBatchScanner(nodeType) {
     };
 }
 
+// 在加载节点（ImageLoader/VideoLoader/VideoLoaderPath）上换文件时，
+// 把 path 输出连着的下游 VQA 节点的 prompt 下拉栏刷一遍
+function registerLoaderPropagate(nodeType, widgetName) {
+    const origOnNodeCreated = nodeType.prototype.onNodeCreated;
+    nodeType.prototype.onNodeCreated = function () {
+        if (origOnNodeCreated) origOnNodeCreated.apply(this, arguments);
+        const node = this;
+        const w = node.widgets?.find((x) => x.name === widgetName);
+        if (!w) return;
+        const origCb = w.callback;
+        w.callback = function () {
+            const result = origCb?.apply(this, arguments);
+            setTimeout(() => {
+                for (const out of node.outputs || []) {
+                    if (!out?.links) continue;
+                    for (const lid of out.links) {
+                        const link = app.graph.links[lid];
+                        if (!link) continue;
+                        const target = app.graph.getNodeById(link.target_id);
+                        try {
+                            target?.__vqaRefresh?.();
+                        } catch (e) {
+                            console.warn("[Qwen3_VQA] downstream refresh failed", e);
+                        }
+                    }
+                }
+            }, 0);
+            return result;
+        };
+    };
+}
+
 app.registerExtension({
     name: "Comfyui_Qwen3-VL-Instruct.VQACache",
 
@@ -496,6 +597,10 @@ app.registerExtension({
             registerVqaCache(nodeType);
         } else if (nodeData?.name === BATCH_NODE_NAME) {
             registerBatchScanner(nodeType);
+        } else if (nodeData?.name === "ImageLoader") {
+            registerLoaderPropagate(nodeType, "image");
+        } else if (nodeData?.name === "VideoLoader" || nodeData?.name === "VideoLoaderPath") {
+            registerLoaderPropagate(nodeType, "file");
         }
     },
 });
