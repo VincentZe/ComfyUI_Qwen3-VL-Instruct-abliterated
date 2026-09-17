@@ -2,6 +2,7 @@ import os
 import json
 import datetime
 import threading
+import weakref
 import torch
 import folder_paths
 from torchvision.transforms import ToPILImage
@@ -326,8 +327,18 @@ def _estimate_model_bytes(path: str, quantization: str) -> int:
         return 0
 
 
+# 本插件缓存了模型（未释放）的节点实例。ComfyUI 只能调度它自己管理的模型，
+# 这里的 transformers 模型对它不可见——所以生命周期得自己管两头：
+#   加载前：显存不够 -> 请 ComfyUI 卸载它的模型（见加载处 unload_all_models）；
+#   让位后：新 prompt 不含 VQA 节点 -> 主动释放本插件模型，把显存还给 ComfyUI
+#   （见文件尾部的 prompt 队列钩子）。
+_VQA_INSTANCES = weakref.WeakSet()
+_VQA_NODE_CLASSES = {"Qwen3_VQA", "Qwen3_VL_BatchCache"}
+
+
 class Qwen3_VQA:
     def __init__(self):
+        _VQA_INSTANCES.add(self)
         self.model_checkpoint = None
         self.processor = None
         self.model = None
@@ -344,6 +355,31 @@ class Qwen3_VQA:
         self.current_attention = None
         self.current_min_pixels = None
         self.current_max_pixels = None
+
+    def release_model(self, reason: str = "") -> bool:
+        """释放已加载的模型与 processor，归还显存。返回是否真的释放了东西。"""
+        if self.model is None and self.processor is None:
+            return False
+        try:
+            del self.model
+            self.model = None
+            del self.processor
+            self.processor = None
+            # current_* 一并复位：下次进来走完整重载路径
+            self.current_model_id = None
+            self.current_quantization = None
+            self.current_attention = None
+            self.current_min_pixels = None
+            self.current_max_pixels = None
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+                torch.cuda.ipc_collect()
+            if reason:
+                print(f"[Qwen3_VQA] 已释放模型显存（{reason}）")
+            return True
+        except Exception as e:
+            print(f"[Qwen3_VQA] 释放模型失败：{e!r}")
+            return False
 
     @classmethod
     def INPUT_TYPES(s):
@@ -661,18 +697,7 @@ class Qwen3_VQA:
             )
 
             if not keep_model_loaded:
-                del self.processor  # release processor memory
-                del self.model  # release model memory
-                self.processor = None  # set processor to None
-                self.model = None  # set model to None
-                self.current_model_id = None
-                self.current_quantization = None
-                self.current_attention = None
-                self.current_min_pixels = None
-                self.current_max_pixels = None
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()  # release GPU memory
-                    torch.cuda.ipc_collect()
+                self.release_model("keep_model_loaded=False")
 
             output_text = result[0]
 
@@ -956,3 +981,56 @@ if _HAS_SERVER:
             "files": files[:limit],
             "truncated": len(files) > limit,
         })
+
+
+def _maybe_release_for_prompt(prompt) -> int:
+    """新 prompt 不含 VQA 类节点时，释放本插件所有缓存实例的模型。返回释放个数。
+
+    这是'反向让位'：ComfyUI 加载 SD 等模型前会清它自己的缓存，但看不见
+    本插件的 16GB 模型，不主动让位的话它只能把自己降到 lowvram/流式加载。
+    """
+    if not isinstance(prompt, dict):
+        return 0
+    used = {v.get("class_type") for v in prompt.values() if isinstance(v, dict)}
+    if used & _VQA_NODE_CLASSES:
+        return 0
+    released = 0
+    for inst in list(_VQA_INSTANCES):
+        try:
+            if inst.release_model("新任务不含 VQA 节点，为其它模型腾显存"):
+                released += 1
+        except Exception as e:
+            print(f"[Qwen3_VQA] 让位释放失败（忽略）：{e!r}")
+    return released
+
+
+def _install_prompt_releaser() -> None:
+    """包一层 PromptServer 的 prompt 队列：每次入队时检查要不要让位。"""
+    try:
+        q = PromptServer.instance.prompt_queue
+    except Exception:
+        return
+    if q is None or getattr(q, "_qwen3_vqa_releaser", False):
+        return
+    orig_put = q.put
+
+    def put(item):
+        try:
+            # 队列条目: (number, prompt_id, prompt, extra_data, outputs_to_execute)
+            if isinstance(item, (tuple, list)) and len(item) > 2:
+                n = _maybe_release_for_prompt(item[2])
+                if n:
+                    print(f"[Qwen3_VQA] 已为不含 VQA 的新任务释放 {n} 个实例的模型")
+        except Exception as e:
+            print(f"[Qwen3_VQA] prompt 队列钩子异常（忽略）：{e!r}")
+        return orig_put(item)
+
+    q.put = put
+    q._qwen3_vqa_releaser = True
+
+
+try:
+    _install_prompt_releaser()
+except Exception:
+    # 测试环境 / PromptServer 尚未就绪时静默跳过，不影响节点加载
+    pass

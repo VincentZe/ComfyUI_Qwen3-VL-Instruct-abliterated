@@ -491,6 +491,37 @@ finally:
     else:
         sys.modules['sageattention'] = _saved_sa
 
+# ================================================================ 7.5 显存让位
+print('\n=== 7.5 新 prompt 不含 VQA → 释放模型显存（反向让位） ===')
+
+
+class _FakeWeight:
+    """能挡住 `del` 的哑模型对象，仅用于验证释放逻辑。"""
+
+
+_inst75 = nodes.Qwen3_VQA()
+_inst75.model = _FakeWeight()
+_inst75.processor = _FakeWeight()
+_r1 = _inst75.release_model('测试')
+chk('release_model 有模型时返回 True', _r1 is True)
+chk('release_model 后 model/processor 均置空',
+    _inst75.model is None and _inst75.processor is None)
+chk('release_model 重复调用返回 False', _inst75.release_model() is False)
+
+# 当前实例载着哑模型，看 prompt 队列钩子的判定
+_inst75.model = _FakeWeight()
+_inst75.processor = _FakeWeight()
+_vqa_prompt = {'1': {'class_type': 'Qwen3_VQA'}, '2': {'class_type': 'KSampler'}}
+nodes._maybe_release_for_prompt(_vqa_prompt)
+chk('prompt 含 Qwen3_VQA → 不释放', _inst75.model is not None)
+
+_other_prompt = {'1': {'class_type': 'KSampler'}, '2': {'class_type': 'VAEDecode'}}
+nodes._maybe_release_for_prompt(_other_prompt)
+chk('prompt 不含任何 VQA 节点 → 释放', _inst75.model is None)
+
+_non_dict = ['not', 'a', 'prompt']
+chk('非 dict prompt → 安全跳过', nodes._maybe_release_for_prompt(_non_dict) == 0)
+
 # 收尾：还原 models_dir 并清掉临时目录
 _fp.models_dir = _old_models_dir
 shutil.rmtree(_models_root, ignore_errors=True)
