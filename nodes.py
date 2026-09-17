@@ -336,9 +336,43 @@ _VQA_INSTANCES = weakref.WeakSet()
 _VQA_NODE_CLASSES = {"Qwen3_VQA", "Qwen3_VL_BatchCache"}
 
 
+def _ensure_vram_for(need_bytes: int, label: str) -> None:
+    """空闲显存不足以 {label} 时，请 ComfyUI 先卸载它管理的模型。
+
+    ComfyUI 只管理它自己加载的模型（checkpoint/LoRA 走 model_management）；
+    本节点经 transformers 直接加载，对它完全不可见。不主动请它让位的话，
+    device_map="auto" / model.to(device) 就会因空闲显存不足而把权重塞进
+    CPU（device_map 路径）或直接 OOM（to 路径）。走 unload_all_models()
+    是 ComfyUI 的 smart memory 路径：权重留内存，下次快速重载。
+    """
+    if not need_bytes or not torch.cuda.is_available():
+        return
+    try:
+        free = torch.cuda.mem_get_info()[0]
+    except Exception:
+        return
+    if not free or free >= need_bytes * 1.1:
+        return
+    unloader = getattr(comfy.model_management, "unload_all_models", None)
+    if not callable(unloader):
+        return
+    print(
+        f"[Qwen3_VQA] 空闲显存 {free / 2**30:.1f} GB 不足以{label}"
+        f"（约需 {need_bytes / 2**30:.1f} GB），先卸载 ComfyUI 管理的模型"
+        f"（其权重会留在内存以便快速重载）"
+    )
+    try:
+        unloader()
+    except Exception as e:
+        print(f"[Qwen3_VQA] 卸载 ComfyUI 模型失败（继续）：{e!r}")
+    torch.cuda.empty_cache()
+    torch.cuda.ipc_collect()
+
+
 class Qwen3_VQA:
     def __init__(self):
         _VQA_INSTANCES.add(self)
+        self._offloaded = False  # True = 模型整托管在内存里，用前先搬回显存
         self.model_checkpoint = None
         self.processor = None
         self.model = None
@@ -356,10 +390,37 @@ class Qwen3_VQA:
         self.current_min_pixels = None
         self.current_max_pixels = None
 
-    def release_model(self, reason: str = "") -> bool:
-        """释放已加载的模型与 processor，归还显存。返回是否真的释放了东西。"""
+    def release_model(self, reason: str = "", offload: bool = False) -> bool:
+        """释放/让位模型。offload=True 时优先整托管进内存（更快回归）。
+
+        返回是否真的释放/让位了东西。
+        - offload（让位）：model.to('cpu') 保留对象与 current_* 参数，
+          下次 inference 只需一次 PCIe 搬回，不用重新解析 safetensors。
+          仅 fp16/bf16 可行——bnb 量化的权重不支持搬设备；且模型带
+          accelerate 多设备 dispatch（hf_device_map 混合设备）时 hook
+          会被 .to 破坏，这两种情况退回彻底释放。
+        - 彻底释放：del model/processor 并复位 current_*，下次完整重载。
+        """
         if self.model is None and self.processor is None:
             return False
+        if offload and self.model is not None and self.current_quantization == "none":
+            _dm = getattr(self.model, "hf_device_map", None)
+            _mixed = _dm is not None and (
+                any(str(v) == "cpu" for v in _dm.values())
+                or len(set(str(v) for v in _dm.values())) > 1
+            )
+            if not _mixed:
+                try:
+                    self.model.to("cpu")
+                    self._offloaded = True
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+                        torch.cuda.ipc_collect()
+                    if reason:
+                        print(f"[Qwen3_VQA] 模型已整托管进内存（{reason}），下次使用直接搬回显存")
+                    return True
+                except Exception as e:
+                    print(f"[Qwen3_VQA] 整托管进内存失败，退回彻底释放：{e!r}")
         try:
             del self.model
             self.model = None
@@ -371,6 +432,7 @@ class Qwen3_VQA:
             self.current_attention = None
             self.current_min_pixels = None
             self.current_max_pixels = None
+            self._offloaded = False
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
                 torch.cuda.ipc_collect()
@@ -380,6 +442,19 @@ class Qwen3_VQA:
         except Exception as e:
             print(f"[Qwen3_VQA] 释放模型失败：{e!r}")
             return False
+
+    def _restore_offloaded_model(self) -> bool:
+        """把让位进内存的模型搬回显存。返回是否执行了搬回。"""
+        if not self._offloaded or self.model is None:
+            return False
+        _ensure_vram_for(
+            _estimate_model_bytes(self.model_checkpoint, self.current_quantization),
+            "搬回模型",
+        )
+        self.model.to(self.device)
+        self._offloaded = False
+        print("[Qwen3_VQA] 模型已从内存搬回显存（跳过重载）")
+        return True
 
     @classmethod
     def INPUT_TYPES(s):
@@ -508,6 +583,10 @@ class Qwen3_VQA:
                 local_dir_use_symlinks=False,
             )
 
+        # 上次让位进内存的模型先搬回显存：current_* 没复位，下面的重载检查
+        # 会因参数未变而跳过，直接用现成模型（比重新 from_pretrained 快得多）。
+        self._restore_offloaded_model()
+
         # model_id / 量化 / 注意力实现 / 像素预算 变了就重载 processor 与模型。
         # 注意这些参数都只在"加载时"生效：attention 决定 attn_implementation，
         # min/max_pixels 决定 processor 的 smart_resize 预算。ComfyUI 会缓存节点实例，
@@ -555,30 +634,11 @@ class Qwen3_VQA:
             else:
                 quantization_config = None
 
-            # ComfyUI 只管理它自己加载的模型（checkpoint/LoRA 走 model_management）；
-            # 本节点经 transformers 直接加载，对它完全不可见。device_map="auto"
-            # 又只看加载瞬间的空闲显存——不先把 ComfyUI 缓存的模型请出显存，
-            # accelerate 就会把语言层 offload 到 CPU，推理慢一个数量级。
-            _need = _estimate_model_bytes(self.model_checkpoint, quantization)
-            if _need and torch.cuda.is_available():
-                try:
-                    _free = torch.cuda.mem_get_info()[0]
-                except Exception:
-                    _free = 0
-                if _free and _free < _need * 1.1:
-                    _unloader = getattr(comfy.model_management, "unload_all_models", None)
-                    if callable(_unloader):
-                        print(
-                            f"[Qwen3_VQA] 空闲显存 {_free / 2**30:.1f} GB 装不下模型"
-                            f"（约需 {_need / 2**30:.1f} GB），先卸载 ComfyUI 管理的模型"
-                            f"（其权重会留在内存以便快速重载）再加载"
-                        )
-                        try:
-                            _unloader()
-                        except Exception as e:
-                            print(f"[Qwen3_VQA] 卸载 ComfyUI 模型失败（继续加载）：{e!r}")
-                    torch.cuda.empty_cache()
-                    torch.cuda.ipc_collect()
+            # 空闲显存不足就先请 ComfyUI 让位（smart memory 权重留内存），
+            # 避免 accelerate 把语言层 offload 到 CPU 导致推理慢一个数量级。
+            _ensure_vram_for(
+                _estimate_model_bytes(self.model_checkpoint, quantization), "加载模型"
+            )
 
             self.model = Qwen3VLForConditionalGeneration.from_pretrained(
                 self.model_checkpoint,
@@ -587,6 +647,7 @@ class Qwen3_VQA:
                 attn_implementation=attention,
                 quantization_config=quantization_config,
             )
+            self._offloaded = False
             # device_map="auto" 按加载瞬间的空闲显存切分：显存不够就把语言层
             # offload 到 CPU，推理慢一个数量级。这里明确报出来，别让用户从
             # device_map 日志里自己猜。
@@ -997,7 +1058,9 @@ def _maybe_release_for_prompt(prompt) -> int:
     released = 0
     for inst in list(_VQA_INSTANCES):
         try:
-            if inst.release_model("新任务不含 VQA 节点，为其它模型腾显存"):
+            # offload=True：fp16/bf16 模型整托管进内存，下次只搬回显存；
+            # bnb 量化 / accelerate 混合设备的模型自动退回彻底释放。
+            if inst.release_model("新任务不含 VQA 节点，为其它模型腾显存", offload=True):
                 released += 1
         except Exception as e:
             print(f"[Qwen3_VQA] 让位释放失败（忽略）：{e!r}")

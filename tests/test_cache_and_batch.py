@@ -522,6 +522,54 @@ chk('prompt 不含任何 VQA 节点 → 释放', _inst75.model is None)
 _non_dict = ['not', 'a', 'prompt']
 chk('非 dict prompt → 安全跳过', nodes._maybe_release_for_prompt(_non_dict) == 0)
 
+# ---- 7.5b 让位进内存（offload）与搬回 ----
+class _Movable:
+    """支持 .to(device) 的哑模型，记录被搬去哪。"""
+
+    def __init__(self, **attrs):
+        self.dev = 'cuda:0'
+        for k, v in attrs.items():
+            setattr(self, k, v)
+
+    def to(self, d):
+        self.dev = str(d)
+        return self
+
+
+_inst75b = nodes.Qwen3_VQA()
+_inst75b.model = _Movable()
+_inst75b.processor = _FakeWeight()
+_inst75b.current_quantization = 'none'
+_inst75b.current_model_id = 'huihui-ai/x'
+_r = _inst75b.release_model('测试让位', offload=True)
+chk('fp16/bf16 让位 → 整托管进内存', _r is True and _inst75b._offloaded is True)
+chk('  └ 模型对象保留、被搬到 cpu', _inst75b.model is not None and _inst75b.model.dev == 'cpu')
+chk('  └ current_* 保留（下次免重载）', _inst75b.current_model_id == 'huihui-ai/x')
+
+_r = _inst75b._restore_offloaded_model()
+chk('搬回显存 → 返回 True 且清除让位标记',
+    _r is True and _inst75b._offloaded is False)
+chk('  └ 模型被搬到 self.device', _inst75b.model.dev == str(_inst75b.device))
+chk('让位标记清除后再 restore → 不动作', _inst75b._restore_offloaded_model() is False)
+
+# bnb 量化不支持搬设备 → 让位自动退回彻底释放
+_inst75c = nodes.Qwen3_VQA()
+_inst75c.model = _Movable()
+_inst75c.processor = _FakeWeight()
+_inst75c.current_quantization = '4bit'
+_inst75c.release_model('测试4bit', offload=True)
+chk('bnb 量化让位 → 退回彻底释放（模型置 None）',
+    _inst75c.model is None and _inst75c._offloaded is False)
+
+# accelerate 混合设备（hf_device_map 有 cpu）→ 让位退回彻底释放，避免破坏 hook
+_inst75d = nodes.Qwen3_VQA()
+_inst75d.model = _Movable(hf_device_map={'model.visual': 0, 'model.language_model': 'cpu'})
+_inst75d.processor = _FakeWeight()
+_inst75d.current_quantization = 'none'
+_inst75d.release_model('测试混合设备', offload=True)
+chk('混合设备 hf_device_map 让位 → 退回彻底释放',
+    _inst75d.model is None and _inst75d._offloaded is False)
+
 # 收尾：还原 models_dir 并清掉临时目录
 _fp.models_dir = _old_models_dir
 shutil.rmtree(_models_root, ignore_errors=True)
