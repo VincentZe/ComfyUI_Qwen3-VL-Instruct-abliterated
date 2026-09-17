@@ -7,7 +7,7 @@ class MultiplePathsInput:
         return {
             "required": {
                 "inputcount": ("INT", {"default": 1, "min": 1, "max": 1000, "step": 1}),
-                "path_1": ("PATH",),
+                "path_1": ("STRING",),
             },
             "optional": {
                 "sample_fps": ("INT", {"default": 1, "min": 1, "max": 1000, "step": 1}),
@@ -20,7 +20,7 @@ class MultiplePathsInput:
             },
         }
 
-    RETURN_TYPES = ("PATH",)
+    RETURN_TYPES = ("STRING",)
     RETURN_NAMES = ("paths",)
     FUNCTION = "combine"
     CATEGORY = "Comfyui_Qwen3-VL-Instruct"

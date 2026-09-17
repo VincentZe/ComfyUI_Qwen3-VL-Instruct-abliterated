@@ -21,14 +21,14 @@
       "inputs": [
         {
           "name": "path_1",
-          "type": "PATH",
+          "type": "STRING",
           "link": 71
         }
       ],
       "outputs": [
         {
           "name": "paths",
-          "type": "PATH",
+          "type": "STRING",
           "slot_index": 0,
           "links": [
             70
@@ -70,8 +70,8 @@
           "links": null
         },
         {
-          "name": "PATH",
-          "type": "PATH",
+          "name": "path",
+          "type": "STRING",
           "links": [
             71
           ]
@@ -141,10 +141,13 @@
       "mode": 0,
       "inputs": [
         {
-          "name": "source_path",
+          "name": "image_path",
           "shape": 7,
-          "type": "PATH",
-          "link": 70
+          "type": "STRING",
+          "link": 70,
+          "widget": {
+            "name": "image_path"
+          }
         },
         {
           "name": "image",
@@ -197,7 +200,7 @@
       0,
       56,
       0,
-      "PATH"
+      "STRING"
     ],
     [
       71,
@@ -205,7 +208,7 @@
       2,
       57,
       0,
-      "PATH"
+      "STRING"
     ]
   ],
   "groups": [],

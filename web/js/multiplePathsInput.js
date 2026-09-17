@@ -9,7 +9,10 @@ app.registerExtension({
         switch (nodeData.name) {
             case "MultiplePathsInput":
                 nodeType.prototype.onNodeCreated = function () {
-                    this._type = "PATH";
+                    // path_N 输入已从自定义 "PATH" 类型统一改成 "STRING"，
+                    // 这样 Load Image Advanced / VideoLoader 的 path 输出能直接连进来，
+                    // 输出也能连到 Qwen3_VQA 的 image_path 控件。
+                    this._type = "STRING";
                     this.inputs_offset = nodeData.name.includes("selective") ? 1 : 0;
                     this.addWidget("button", "Update inputs", null, () => {
                         if (!this.inputs) {

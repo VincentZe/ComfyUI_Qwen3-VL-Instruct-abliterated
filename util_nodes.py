@@ -25,7 +25,8 @@ class ImageLoader:
 
     CATEGORY = "Comfyui_Qwen3-VL-Instruct"
 
-    RETURN_TYPES = ("IMAGE", "MASK", "PATH")
+    RETURN_TYPES = ("IMAGE", "MASK", "STRING")
+    RETURN_NAMES = ("IMAGE", "MASK", "path")
     FUNCTION = "load_image"
 
     def load_image(self, image):
@@ -104,7 +105,8 @@ class VideoLoader(ComfyNodeABC):
 
     CATEGORY = "Comfyui_Qwen3-VL-Instruct"
 
-    RETURN_TYPES = (IO.VIDEO, "PATH")
+    RETURN_TYPES = (IO.VIDEO, "STRING")
+    RETURN_NAMES = ("VIDEO", "path")
     FUNCTION = "load_video"
 
     def load_video(self, file):
@@ -138,7 +140,8 @@ class VideoLoaderPath(ComfyNodeABC):
 
     CATEGORY = "Comfyui_Qwen3-VL-Instruct"
 
-    RETURN_TYPES = (IO.VIDEO, "PATH")
+    RETURN_TYPES = (IO.VIDEO, "STRING")
+    RETURN_NAMES = ("VIDEO", "path")
     FUNCTION = "load_video"
 
     def load_video(self, file):

@@ -31,8 +31,8 @@
           "links": null
         },
         {
-          "name": "PATH",
-          "type": "PATH",
+          "name": "path",
+          "type": "STRING",
           "slot_index": 2,
           "links": [
             80
@@ -65,19 +65,19 @@
       "inputs": [
         {
           "name": "path_1",
-          "type": "PATH",
+          "type": "STRING",
           "link": 72
         },
         {
           "name": "path_2",
-          "type": "PATH",
+          "type": "STRING",
           "link": 80
         }
       ],
       "outputs": [
         {
           "name": "paths",
-          "type": "PATH",
+          "type": "STRING",
           "slot_index": 0,
           "links": [
             78
@@ -158,8 +158,8 @@
           "links": null
         },
         {
-          "name": "PATH",
-          "type": "PATH",
+          "name": "path",
+          "type": "STRING",
           "links": [
             72
           ]
@@ -190,10 +190,13 @@
       "mode": 0,
       "inputs": [
         {
-          "name": "source_path",
+          "name": "image_path",
           "shape": 7,
-          "type": "PATH",
-          "link": 78
+          "type": "STRING",
+          "link": 78,
+          "widget": {
+            "name": "image_path"
+          }
         },
         {
           "name": "image",
@@ -238,7 +241,7 @@
       2,
       57,
       0,
-      "PATH"
+      "STRING"
     ],
     [
       78,
@@ -246,7 +249,7 @@
       0,
       63,
       0,
-      "PATH"
+      "STRING"
     ],
     [
       79,
@@ -262,7 +265,7 @@
       2,
       57,
       1,
-      "PATH"
+      "STRING"
     ]
   ],
   "groups": [],

@@ -20,12 +20,6 @@
       "mode": 0,
       "inputs": [
         {
-          "name": "source_path",
-          "shape": 7,
-          "type": "PATH",
-          "link": null
-        },
-        {
           "name": "image",
           "shape": 7,
           "type": "IMAGE",

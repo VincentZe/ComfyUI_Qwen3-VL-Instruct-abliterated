@@ -345,7 +345,7 @@ class Qwen3_VQA:
                     {"default": "<new>"},
                 ),
             },
-            "optional": {"source_path": ("PATH",), "image": ("IMAGE",)},
+            "optional": {"image": ("IMAGE",)},
         }
 
     RETURN_TYPES = ("STRING",)
@@ -366,14 +366,27 @@ class Qwen3_VQA:
         use_cache,
         image_path,
         prompt_version,
-        source_path=None,
         image=None,
         attention="eager",
     ):
         # 注意：下面第 300 行左右会用 apply_chat_template 的结果覆盖 text，这里先把提示词原文留一份
         user_text = text
-        if use_cache and image_path and prompt_version and prompt_version != "<new>":
-            hit = _find_entry(image_path, prompt_version)
+        # image_path 是合并后的唯一媒体路径输入，同时兼任提示词缓存键：
+        #   - str：Load Image Advanced / VideoLoader 的 path 输出，或手填的绝对路径；
+        #   - list：MultiplePathsInput 的 content dict 列表（单条时取其中的路径当键，
+        #           多条时没有单一文件可挂缓存，放弃缓存）。
+        if isinstance(image_path, str) and image_path:
+            cache_key = image_path
+        elif (
+            isinstance(image_path, list)
+            and len(image_path) == 1
+            and isinstance(image_path[0], dict)
+        ):
+            cache_key = image_path[0].get("image") or image_path[0].get("video")
+        else:
+            cache_key = None
+        if use_cache and cache_key and prompt_version and prompt_version != "<new>":
+            hit = _find_entry(cache_key, prompt_version)
             if hit is not None:
                 return (hit.get("output", ""),)
         if seed != -1:
@@ -477,36 +490,7 @@ class Qwen3_VQA:
             pil_image.save(temp_path)
 
         with torch.no_grad():
-            if source_path:
-                # source_path 有两种合法来源：
-                #   1) MultiplePathsInput 的输出：已经是
-                #      [{"type": "image"/"video", "image"/"video": 路径}, ...] 的列表；
-                #   2) Load Image Advanced / VideoLoader 的单个 PATH 输出：裸绝对路径字符串。
-                # 裸字符串按扩展名转成 content dict —— 直接 str + list 会 TypeError。
-                if isinstance(source_path, str):
-                    ext = source_path.rsplit(".", 1)[-1].lower()
-                    if ext in ["jpg", "jpeg", "png", "bmp", "tiff", "webp"]:
-                        content_items = [{"type": "image", "image": source_path}]
-                    elif ext in ["mp4", "mkv", "mov", "avi", "flv", "wmv", "webm", "m4v"]:
-                        content_items = [{"type": "video", "video": source_path}]
-                    else:
-                        raise ValueError(
-                            f"[Qwen3_VQA] source_path 指向不支持的文件类型: {source_path}"
-                        )
-                else:
-                    content_items = list(source_path)
-                content_items.append({"type": "text", "text": text})
-                messages = [
-                    {
-                        "role": "system",
-                        "content": "You are QwenVL, you are a helpful assistant expert in turning images into words.",
-                    },
-                    {
-                        "role": "user",
-                        "content": content_items,
-                    },
-                ]
-            elif temp_path:
+            if temp_path:
                 messages = [
                     {
                         "role": "system",
@@ -518,6 +502,33 @@ class Qwen3_VQA:
                             {"type": "image", "image": f"file://{temp_path}"},
                             {"type": "text", "text": text},
                         ],
+                    },
+                ]
+            elif image_path:
+                # image_path 是合并后的唯一媒体来源：
+                #   - str：按扩展名转成 image/video content dict；
+                #   - list：MultiplePathsInput 的 content dict 列表（过滤识别失败的 None）。
+                if isinstance(image_path, str):
+                    ext = image_path.rsplit(".", 1)[-1].lower()
+                    if ext in ["jpg", "jpeg", "png", "bmp", "tiff", "webp"]:
+                        content_items = [{"type": "image", "image": image_path}]
+                    elif ext in ["mp4", "mkv", "mov", "avi", "flv", "wmv", "webm", "m4v"]:
+                        content_items = [{"type": "video", "video": image_path}]
+                    else:
+                        raise ValueError(
+                            f"[Qwen3_VQA] image_path 指向不支持的文件类型: {image_path}"
+                        )
+                else:
+                    content_items = [c for c in image_path if c]
+                content_items.append({"type": "text", "text": text})
+                messages = [
+                    {
+                        "role": "system",
+                        "content": "You are QwenVL, you are a helpful assistant expert in turning images into words.",
+                    },
+                    {
+                        "role": "user",
+                        "content": content_items,
                     },
                 ]
             else:
@@ -574,20 +585,20 @@ class Qwen3_VQA:
 
             output_text = result[0]
 
-            if use_cache and image_path:
+            if use_cache and cache_key:
                 if prompt_version and prompt_version != "<new>":
                     entry_id = prompt_version
-                    if _find_entry(image_path, entry_id) is not None:
-                        print(f"[Qwen3_VQA] cache id {entry_id} already exists for {image_path}, skipping write")
+                    if _find_entry(cache_key, entry_id) is not None:
+                        print(f"[Qwen3_VQA] cache id {entry_id} already exists for {cache_key}, skipping write")
                     else:
-                        _append_entry(image_path, _make_entry(
+                        _append_entry(cache_key, _make_entry(
                             entry_id, model, user_text, output_text, seed,
                             quantization, attention, temperature, max_new_tokens,
                             min_pixels, max_pixels,
                         ))
                 else:
-                    entry_id = _next_id(image_path)
-                    _append_entry(image_path, _make_entry(
+                    entry_id = _next_id(cache_key)
+                    _append_entry(cache_key, _make_entry(
                         entry_id, model, user_text, output_text, seed,
                         quantization, attention, temperature, max_new_tokens,
                         min_pixels, max_pixels,
@@ -718,7 +729,6 @@ class Qwen3_VL_BatchCache:
                     use_cache=True,
                     image_path=img,
                     prompt_version="<new>",
-                    source_path=[{"type": "image", "image": img}],
                     image=None,
                     attention=attention,
                 )

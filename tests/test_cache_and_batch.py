@@ -147,8 +147,8 @@ _REAL_INFERENCE = nodes.Qwen3_VQA.inference  # 第 3 节会把它换掉，第 6 
 
 def fake_inference(self, text, model, keep_model_loaded, temperature, max_new_tokens,
                    min_pixels, max_pixels, seed, quantization, use_cache, image_path,
-                   prompt_version, source_path=None, image=None, attention='eager'):
-    calls.append(dict(image_path=image_path, source_path=source_path, text=text,
+                   prompt_version, image=None, attention='eager'):
+    calls.append(dict(image_path=image_path, text=text,
                       prompt_version=prompt_version, keep_model_loaded=keep_model_loaded,
                       attention=attention))
     e = nodes._next_id(image_path)
@@ -170,7 +170,7 @@ report = batch.run(**kw)[0]
 chk('第一轮 3 张全部生成',
     [os.path.basename(c['image_path']) for c in calls] == ['a.png', 'b.JPG', 'd.webp'],
     ' | ' + report.replace('\n', ' / '))
-chk('source_path 格式正确', calls[0]['source_path'] == [{'type': 'image', 'image': calls[0]['image_path']}])
+chk('批量把图片绝对路径传给 image_path', os.path.isabs(calls[0]['image_path']))
 chk('prompt_version 用 <new>（自动编号）', calls[0]['prompt_version'] == '<new>')
 chk('批量期间 keep_model_loaded=True', all(c['keep_model_loaded'] for c in calls))
 chk('提示词为统一提示词', calls[0]['text'] == '描述这张图')
@@ -355,7 +355,7 @@ _BASE = dict(text='t', model='Qwen3-VL-4B-Instruct-FP8', keep_model_loaded=True,
              temperature=0.7, max_new_tokens=16,
              min_pixels=256 * 28 * 28, max_pixels=1280 * 28 * 28, seed=0,
              quantization='none', use_cache=False, image_path='', prompt_version='<new>',
-             source_path=None, image=None, attention='eager')
+             image=None, attention='eager')
 
 _runner = nodes.Qwen3_VQA()
 _runner.inference(**_BASE)
