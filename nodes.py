@@ -478,6 +478,24 @@ class Qwen3_VQA:
 
         with torch.no_grad():
             if source_path:
+                # source_path 有两种合法来源：
+                #   1) MultiplePathsInput 的输出：已经是
+                #      [{"type": "image"/"video", "image"/"video": 路径}, ...] 的列表；
+                #   2) Load Image Advanced / VideoLoader 的单个 PATH 输出：裸绝对路径字符串。
+                # 裸字符串按扩展名转成 content dict —— 直接 str + list 会 TypeError。
+                if isinstance(source_path, str):
+                    ext = source_path.rsplit(".", 1)[-1].lower()
+                    if ext in ["jpg", "jpeg", "png", "bmp", "tiff", "webp"]:
+                        content_items = [{"type": "image", "image": source_path}]
+                    elif ext in ["mp4", "mkv", "mov", "avi", "flv", "wmv", "webm", "m4v"]:
+                        content_items = [{"type": "video", "video": source_path}]
+                    else:
+                        raise ValueError(
+                            f"[Qwen3_VQA] source_path 指向不支持的文件类型: {source_path}"
+                        )
+                else:
+                    content_items = list(source_path)
+                content_items.append({"type": "text", "text": text})
                 messages = [
                     {
                         "role": "system",
@@ -485,10 +503,7 @@ class Qwen3_VQA:
                     },
                     {
                         "role": "user",
-                        "content": source_path
-                        + [
-                            {"type": "text", "text": text},
-                        ],
+                        "content": content_items,
                     },
                 ]
             elif temp_path:
