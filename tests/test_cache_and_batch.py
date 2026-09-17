@@ -7,7 +7,7 @@
 它只测插件自己的逻辑（目录扫描、JSONL 缓存读写、批量循环、HTTP 接口、下拉选项），
 不测真实推理。sage 走的真实路径由 tests/test_sage_attention.py 用 GPU 验证。
 """
-import sys, os, types, json, asyncio, tempfile, shutil, contextlib
+import sys, os, io, types, json, asyncio, tempfile, shutil, contextlib
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 PLUGIN = os.path.dirname(HERE)
@@ -50,8 +50,26 @@ tf.modeling_utils.AttentionInterface = type('AttentionInterface', (), {
 # 想测「没装 sageattention 时该报错」的用例，把 sys.modules 里这条临时设成 None。
 mod('sageattention', sageattn=lambda *a, **k: None)
 
-mm = mod('comfy.model_management', get_torch_device=lambda: 'cpu',
-         processing_interrupted=lambda: False)
+# comfy.model_management 桩：模拟真实的中断语义
+# （InterruptProcessingException 继承 BaseException；throw_... 抛出时消费标志）
+class _InterruptProcessingException(BaseException):
+    pass
+
+
+mm = mod('comfy.model_management', get_torch_device=lambda: 'cpu')
+mm.InterruptProcessingException = _InterruptProcessingException
+mm._flag = {'v': False}
+mm.processing_interrupted = lambda: mm._flag['v']
+mm.interrupt_current_processing = lambda v=True: mm._flag.__setitem__('v', bool(v))
+
+
+def _throw_if_processing_interrupted():
+    if mm._flag['v']:
+        mm._flag['v'] = False
+        raise _InterruptProcessingException()
+
+
+mm.throw_exception_if_processing_interrupted = _throw_if_processing_interrupted
 comfy = mod('comfy', model_management=mm)
 
 
@@ -208,6 +226,51 @@ def flaky(self, **kwargs):
 nodes.Qwen3_VQA.inference = flaky
 report = batch.run(**{**kw, 'force': True})[0]
 chk('单张失败会记录并继续', '失败        : 1' in report and '模拟推理失败' in report)
+nodes.Qwen3_VQA.inference = fake_inference
+
+# ================================================================ 3.5 生成中断
+print('\n=== 3.5 生成中断（stopping criteria / BatchCache 中断处理） ===')
+
+# 单独测 criteria：无中断 -> False；有中断 -> 抛 BaseException 并消费标志
+crit = nodes._InterruptCheckCriteria()
+chk('无中断时 criteria 返回 False', crit([1, 2], None) is False)
+mm._flag['v'] = True
+raised_crit = None
+try:
+    crit([1, 2], None)
+except BaseException as e:
+    raised_crit = e
+chk('criteria 检测到中断抛 BaseException', isinstance(raised_crit, _InterruptProcessingException), repr(raised_crit))
+chk('抛出时消费了中断标志', mm._flag['v'] is False)
+
+# 批量场景：b.JPG 生成到一半被中断
+calls.clear()
+
+
+def interrupting_inference(self, **kwargs):
+    img = kwargs['image_path']
+    calls.append(os.path.basename(img))
+    if img.endswith('b.JPG'):
+        raise _InterruptProcessingException()  # 模拟 stopping criteria 在生成中触发
+    e = nodes._next_id(img)
+    nodes._append_entry(img, nodes._make_entry(
+        e, 'm', 't', f'OUT-{os.path.basename(img)}', -1, 'none', 'eager', 0.7, 1, 1, 1))
+    return (f'OUT-{os.path.basename(img)}',)
+
+
+nodes.Qwen3_VQA.inference = interrupting_inference
+raised_batch = None
+_buf = io.StringIO()
+with contextlib.redirect_stdout(_buf):
+    try:
+        batch.run(**{**kw, 'force': True})
+    except BaseException as e:
+        raised_batch = e
+chk('BatchCache 把中断异常原样抛出', isinstance(raised_batch, _InterruptProcessingException), repr(raised_batch))
+chk('中断停在出事那张图，后续不再跑', calls == ['a.png', 'b.JPG'], str(calls))
+chk('中断不计入失败', '失败        : 0' in _buf.getvalue())
+chk('报告标注被中断', '!! 被中断' in _buf.getvalue())
+chk('中断前完成的图已写缓存', len(nodes._read_entries(img)) >= 1)
 nodes.Qwen3_VQA.inference = fake_inference
 
 # ================================================================ 4. 接口

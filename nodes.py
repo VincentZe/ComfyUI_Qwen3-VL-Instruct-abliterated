@@ -256,6 +256,31 @@ def _is_interrupted() -> bool:
         return False
 
 
+class _InterruptCheckCriteria:
+    """挂在 model.generate() 的 stopping_criteria 上：每个生成步检查一次
+    ComfyUI 的中断标志。
+
+    ComfyUI 的中断信号原本只在节点之间生效——一次 generate 要跑几分钟，
+    用户按了中断也得干等本节点结束。挂上它之后，中断请求会在下一个
+    解码步（毫秒级）就被抛出，generate 立即终止。
+
+    注意 InterruptProcessingException 继承自 BaseException，
+    下面的 except Exception 不会把它吞掉，只兜住「没有 comfy 的
+    独立运行/测试环境」的 AttributeError。"""
+
+    def __call__(self, input_ids, scores, **kwargs):
+        try:
+            comfy.model_management.throw_exception_if_processing_interrupted()
+        except Exception:
+            pass
+        return False
+
+
+# ComfyUI 的中断异常继承自 BaseException（不会被 except Exception 吞掉）。
+# 独立运行/测试环境的桩里可能没有它，用 getattr 兜底。
+_InterruptExc = getattr(comfy.model_management, "InterruptProcessingException", None)
+
+
 def _release_runner(runner) -> None:
     """批量跑完后统一释放模型/处理器显存。"""
     try:
@@ -555,8 +580,13 @@ class Qwen3_VQA:
             )
             inputs = inputs.to(self.device)
             # Inference: Generation of the output
+            # stopping_criteria：让 ComfyUI 的中断能在生成过程中（而不是
+            # 等整个节点跑完）立刻生效。
             generated_ids = self.model.generate(
-                **inputs, max_new_tokens=max_new_tokens, temperature=temperature
+                **inputs,
+                max_new_tokens=max_new_tokens,
+                temperature=temperature,
+                stopping_criteria=[_InterruptCheckCriteria()],
             )
             generated_ids_trimmed = [
                 out_ids[len(in_ids) :]
@@ -703,6 +733,7 @@ class Qwen3_VL_BatchCache:
         runner = Qwen3_VQA()
         pbar = ProgressBar(total) if (ProgressBar and total) else None
         interrupted = False
+        interrupt_exc = None
 
         for idx, img in enumerate(images, 1):
             if _is_interrupted():
@@ -734,7 +765,16 @@ class Qwen3_VL_BatchCache:
                 )
                 released.append(img)
                 print(f"[Qwen3_VL_BatchCache] ({idx}/{total}) 完成 {img}")
-            except Exception as e:
+            except BaseException as e:  # noqa: BLE001 - 必须区分 ComfyUI 的 BaseException 中断信号
+                if _InterruptExc is not None and isinstance(e, _InterruptExc):
+                    # 生成中途被中断：停止批量，先释放模型再原样抛回给 ComfyUI，
+                    # 让它按标准中断流程收尾（而不是把中断记成「失败」继续跑）。
+                    interrupted = True
+                    interrupt_exc = e
+                    print(f"[Qwen3_VL_BatchCache] ({idx}/{total}) 中断于 {img}")
+                    break
+                if not isinstance(e, Exception):
+                    raise  # KeyboardInterrupt 等其它 BaseException 保持原语义
                 failed.append((img, repr(e)))
                 print(f"[Qwen3_VL_BatchCache] ({idx}/{total}) 失败 {img}: {e!r}")
             finally:
@@ -758,6 +798,8 @@ class Qwen3_VL_BatchCache:
             lines.append(f"  [失败] {path} -> {err}")
         report = "\n".join(lines)
         print(report)
+        if interrupt_exc is not None:
+            raise interrupt_exc  # 模型已释放，把中断交还给 ComfyUI 收尾
         return (report,)
 
 
