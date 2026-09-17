@@ -502,6 +502,18 @@ class Qwen3_VQA:
                 attn_implementation=attention,
                 quantization_config=quantization_config,
             )
+            # device_map="auto" 按加载瞬间的空闲显存切分：显存不够就把语言层
+            # offload 到 CPU，推理慢一个数量级。这里明确报出来，别让用户从
+            # device_map 日志里自己猜。
+            _dm = getattr(self.model, "hf_device_map", None)
+            if _dm:
+                _off = sum(1 for v in _dm.values() if str(v) in ("cpu", "disk"))
+                if _off:
+                    print(
+                        f"[Qwen3_VQA] 警告：{_off}/{len(_dm)} 个模块被 offload 到 CPU/disk，"
+                        f"推理会非常慢。建议：把节点量化设为 4bit，或先释放显存"
+                        f"（卸掉 ComfyUI 里其它已加载的模型）再重跑本节点。"
+                    )
             if _apply_vision_patch_fix is not None:
                 try:
                     _apply_vision_patch_fix(self.model)

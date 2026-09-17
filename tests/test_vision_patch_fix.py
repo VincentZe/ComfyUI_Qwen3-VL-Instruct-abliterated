@@ -153,11 +153,20 @@ finally:
     os.environ.pop("QWEN3_VL_NO_PATCH_FIX", None)
 chk("清掉环境变量后 apply 恢复工作", vpf.apply(_Dummy(), verbose=False) == 1)
 
-# 5b. 多设备（accelerate 卸载）→ 跳过，避免破坏 offload hook
+# 5b. 多设备 device_map 本身不再一刀切跳过：模块真实驻留（非 meta、无 hook）
+#     时照常改写——部分卸载时视觉塔可能仍在 GPU 上，那正是病态慢的重灾区。
 d2 = _Dummy()
-d2.hf_device_map = {"model.visual": 0, "model.language_model": 1}
-chk("多设备 hf_device_map → 跳过改写", vpf.apply(d2, verbose=False) == 0)
-chk("  ...模块未被替换", isinstance(d2.model.visual.patch_embed.proj, nn.Conv3d))
+d2.hf_device_map = {"model.visual": 0, "model.language_model": "cpu"}
+chk("多设备但模块驻留 GPU → 照常改写", vpf.apply(d2, verbose=False) == 1)
+chk("  ...模块已被替换", isinstance(d2.model.visual.patch_embed.proj, vpf.FlattenedPatchEmbed))
+
+# 5b'. accelerate offload hook（_hf_hook）挂在模块上 → 跳过，避免丢 hook 后
+#     新模块滞留 cpu
+d2h = _Dummy()
+d2h.hf_device_map = {"model.visual": "cpu", "model.language_model": 0}
+d2h.model.visual.patch_embed.proj._hf_hook = object()  # 模拟 add_hook_to_module
+chk("挂着 _hf_hook → 跳过改写", vpf.apply(d2h, verbose=False) == 0)
+chk("  ...模块未被替换", isinstance(d2h.model.visual.patch_embed.proj, nn.Conv3d))
 
 # 5c. 单设备 device_map 视为安全，照常改写
 d3 = _Dummy()

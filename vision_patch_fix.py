@@ -89,16 +89,18 @@ def apply(model, verbose: bool = True) -> int:
             print("[Qwen3_VL] 已按环境变量 QWEN3_VL_NO_PATCH_FIX 跳过 patch_embed 改写")
         return 0
 
-    # 模型被切到多个设备（accelerate 卸载）时不动手：替换子模块会让原来的
-    # offload hook 失效，可能把权重放错设备。这种情况下会慢，但不会算错。
-    device_map = getattr(model, "hf_device_map", None)
-    if device_map and len(set(device_map.values())) > 1:
-        if verbose:
-            print(f"[Qwen3_VL] 检测到多设备 device_map，跳过 patch_embed 改写：{device_map}")
-        return 0
+    # 注意：不要按"device_map 有多个设备"一刀切跳过。部分卸载时视觉塔可能
+    # 仍完整驻留在 GPU 上（hf_device_map 里 'model.visual': 0），那正是
+    # bf16 Conv3d 病态慢的重灾区。安全的判定是逐模块看：
+    #   - 权重还在 meta 设备（卸载尚未加载）→ 不能碰；
+    #   - 模块挂着 accelerate 的 _hf_hook（offload 由 hook 在前向时搬权重）
+    #     → 换掉模块会丢 hook，不能碰。
+    # 其余情况（真实驻留在某块设备上、无 hook）替换成等价 Linear 不会影响
+    # 其它层的 offload 路径。
 
     replaced = 0
     skipped_meta = 0
+    skipped_hook = 0
     for name, module in list(model.named_modules()):
         if not name.endswith("patch_embed.proj"):
             continue
@@ -111,6 +113,11 @@ def apply(model, verbose: bool = True) -> int:
         if module.weight.is_meta:
             skipped_meta += 1
             continue
+        # accelerate offload hook 挂在模块上（前向时由 hook 搬权重）→ 换掉模块
+        # 会把 hook 一起丢掉，新模块会滞留在 cpu 上算。跳过：慢，但不会错。
+        if hasattr(module, "_hf_hook"):
+            skipped_hook += 1
+            continue
         parent = model.get_submodule(name.rsplit(".", 1)[0])
         new = FlattenedPatchEmbed(module).to(device=module.weight.device, dtype=module.weight.dtype)
         setattr(parent, "proj", new)
@@ -121,6 +128,8 @@ def apply(model, verbose: bool = True) -> int:
 
     if verbose and skipped_meta:
         print(f"[Qwen3_VL] {skipped_meta} 个 patch_embed 权重仍在 meta 设备（未加载），跳过改写")
+    if verbose and skipped_hook:
+        print(f"[Qwen3_VL] {skipped_hook} 个 patch_embed 挂着 accelerate offload hook，跳过改写")
     if verbose and not replaced and not skipped_meta:
         print("[Qwen3_VL] 未找到可改写的 patch_embed Conv3d（版本可能已变，跳过）")
     return replaced
