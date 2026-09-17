@@ -302,6 +302,30 @@ def _release_runner(runner) -> None:
         pass
 
 
+def _estimate_model_bytes(path: str, quantization: str) -> int:
+    """估算模型权重的显存占用（字节），用于判断加载前是否需要腾显存。
+
+    safetensors 里存的是 bf16/fp16（2 字节/参数），bnb 量化按实际压缩比粗估
+    并留余量：4bit ≈ 0.55 B/参数（0.35 倍），8bit ≈ 1.06 B/参数（0.65 倍）。
+    估算不出（路径不存在 / 非本地目录）返回 0，调用方就当作"不干预"。
+    """
+    try:
+        p = Path(path)
+        if p.is_file():
+            files = [p]
+        elif p.is_dir():
+            files = [f for f in p.rglob("*") if f.suffix == ".safetensors"]
+        else:
+            return 0
+        total = sum(f.stat().st_size for f in files)
+        if not total:
+            return 0
+        ratio = {"4bit": 0.35, "8bit": 0.65}.get(quantization, 1.0)
+        return int(total * ratio)
+    except Exception:
+        return 0
+
+
 class Qwen3_VQA:
     def __init__(self):
         self.model_checkpoint = None
@@ -494,6 +518,31 @@ class Qwen3_VQA:
                 )
             else:
                 quantization_config = None
+
+            # ComfyUI 只管理它自己加载的模型（checkpoint/LoRA 走 model_management）；
+            # 本节点经 transformers 直接加载，对它完全不可见。device_map="auto"
+            # 又只看加载瞬间的空闲显存——不先把 ComfyUI 缓存的模型请出显存，
+            # accelerate 就会把语言层 offload 到 CPU，推理慢一个数量级。
+            _need = _estimate_model_bytes(self.model_checkpoint, quantization)
+            if _need and torch.cuda.is_available():
+                try:
+                    _free = torch.cuda.mem_get_info()[0]
+                except Exception:
+                    _free = 0
+                if _free and _free < _need * 1.1:
+                    _unloader = getattr(comfy.model_management, "unload_all_models", None)
+                    if callable(_unloader):
+                        print(
+                            f"[Qwen3_VQA] 空闲显存 {_free / 2**30:.1f} GB 装不下模型"
+                            f"（约需 {_need / 2**30:.1f} GB），先卸载 ComfyUI 管理的模型"
+                            f"（其权重会留在内存以便快速重载）再加载"
+                        )
+                        try:
+                            _unloader()
+                        except Exception as e:
+                            print(f"[Qwen3_VQA] 卸载 ComfyUI 模型失败（继续加载）：{e!r}")
+                    torch.cuda.empty_cache()
+                    torch.cuda.ipc_collect()
 
             self.model = Qwen3VLForConditionalGeneration.from_pretrained(
                 self.model_checkpoint,
