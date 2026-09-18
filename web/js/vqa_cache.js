@@ -33,6 +33,9 @@ const CacheAPI = {
             `/qwen3_vqa/batch/scan?directory=${enc(directory)}&recursive=${recursive ? 1 : 0}`
         );
     },
+    index() {
+        return fetchJson(`/qwen3_vqa/cache/index`);
+    },
 };
 
 function clip(text, max = 28) {
@@ -59,9 +62,9 @@ async function resolveImagePath(node) {
         const origin = app.graph.getNodeById(link.origin_id);
         if (!origin) return "";
 
-        if (origin.type === "ImageLoader" || origin.type === "VideoLoader") {
+        if (origin.type === "ImageLoader" || origin.type === "LoadImage" || origin.type === "VideoLoader") {
             const w = origin.widgets?.find((x) =>
-                x.name === (origin.type === "ImageLoader" ? "image" : "file")
+                x.name === (origin.type === "VideoLoader" ? "file" : "image")
             );
             const name = String(w?.value || "").trim();
             if (!name) return "";
@@ -186,7 +189,10 @@ function labelFor(value, metaMap) {
     const meta = metaMap.get(value);
     if (!meta) return `${value} · (缓存缺失，运行将重建该条)`;
     const sum = clip(meta.summary);
-    return sum ? `${value} · ${sum}` : value;
+    // 全量索引兜底时带出所属图片名，方便在同 id 条目间分辨
+    const base = meta.image ? meta.image.split(/[\\/]/).pop() : "";
+    const head = base ? `${value} · ${base}` : value;
+    return sum ? `${head} · ${sum}` : head;
 }
 
 async function openManager(node) {
@@ -475,8 +481,36 @@ function registerVqaCache(nodeType) {
             } catch (e) {
                 console.warn("[Qwen3_VQA] resolve image_path failed", e);
             }
+
             if (!imagePath) {
-                resetDropdown();
+                // 路径解析不出来（未知上游类型 / 连线刚拉上 / 没连）→
+                // 兜底走后端全量缓存索引，不运行工作流也有选项可选。
+                // 选项标签带所属图片名；若 image_path 还是自由控件（没连线、
+                // 没手填），选中某条时会顺手把它的图片路径填进去。
+                try {
+                    const data = await CacheAPI.index();
+                    metaMap.clear();
+                    const values = [NEW_VALUE];
+                    for (const img of data.images || []) {
+                        for (const meta of img.entries || []) {
+                            if (!meta.id || metaMap.has(meta.id)) continue;
+                            metaMap.set(meta.id, { ...meta, image: img.path });
+                            values.push(meta.id);
+                        }
+                    }
+                    const current = versionWidget.value;
+                    if (current && current !== NEW_VALUE && !values.includes(current)) {
+                        values.push(current);
+                    }
+                    versionWidget.options.values = values;
+                    applyLabelMapper();
+                    if (!values.includes(versionWidget.value)) {
+                        versionWidget.value = NEW_VALUE;
+                    }
+                } catch (e) {
+                    console.warn("[Qwen3_VQA] cache index fetch failed", e);
+                    resetDropdown();
+                }
                 return;
             }
 
@@ -527,8 +561,42 @@ function registerVqaCache(nodeType) {
         wrap(pathWidget);
         wrap(useCacheWidget);
 
+        // 从全量索引里选中某条时：如果 image_path 还是自由控件（没连线、没手填），
+        // 把该条目所属图片的路径填进去，保证运行时缓存能命中
+        const origVersionCb = versionWidget.callback;
+        versionWidget.callback = function () {
+            const result = origVersionCb?.apply(this, arguments);
+            try {
+                const meta = metaMap.get(versionWidget.value);
+                const linked = node.inputs?.some(
+                    (i) => i && i.name === "image_path" && i.link != null
+                );
+                if (meta?.image && !linked && pathWidget && !String(pathWidget.value || "").trim()) {
+                    pathWidget.value = meta.image;
+                }
+            } catch (e) {
+                console.warn("[Qwen3_VQA] fill image_path from index failed", e);
+            }
+            return result;
+        };
+
         applyLabelMapper();
         refresh();
+    };
+
+    // 连线变化（拉上/拔掉 image_path 的上游）时自动刷新下拉栏——
+    // 之前只有手点刷新按钮或换图才会刷，连线刚拉上时下拉永远是 <new>
+    const origOnConnectionsChange = nodeType.prototype.onConnectionsChange;
+    nodeType.prototype.onConnectionsChange = function () {
+        const result = origOnConnectionsChange?.apply(this, arguments);
+        setTimeout(() => {
+            try {
+                this.__vqaRefresh?.();
+            } catch (e) {
+                console.warn("[Qwen3_VQA] refresh on connection change failed", e);
+            }
+        }, 0);
+        return result;
     };
 
     const origOnConfigure = nodeType.prototype.onConfigure;

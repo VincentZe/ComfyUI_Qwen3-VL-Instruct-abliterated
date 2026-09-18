@@ -1004,6 +1004,59 @@ if _HAS_SERVER:
             return web.json_response({"error": "name is required"}, status=400)
         return web.json_response({"path": folder_paths.get_annotated_filepath(name)})
 
+    @PromptServer.instance.routes.get("/qwen3_vqa/cache/index")
+    async def vqa_cache_index(request):
+        """全量缓存索引：前端下拉栏的兜底数据源（Lora Manager 同款思路）。
+
+        prompt 下拉依赖 image_path，而 image_path 走连线时运行前拿不到值，
+        连线反推也不总是可行（未知上游类型 / 连线刚拉上没触发刷新）。
+        这里直接扫描 ComfyUI 的 input / output 根目录（+ 可选 roots 参数，
+        分号分隔），把所有 sidecar 缓存列出来，前端不跑工作流也有选项。
+        """
+        roots_param = request.query.get("roots", "").strip()
+        roots = [r.strip() for r in roots_param.split(";") if r.strip()]
+        try:
+            roots.insert(0, folder_paths.get_directory("input"))
+            roots.append(folder_paths.get_directory("output"))
+        except Exception:
+            pass
+        seen = set()
+        images = []
+        total_entries = 0
+        truncated = False
+        MAX_IMAGES = 3000
+        for root in roots:
+            if not root or root in seen or not os.path.isdir(root):
+                continue
+            seen.add(root)
+            for dirpath, _dirnames, filenames in os.walk(root):
+                for fn in filenames:
+                    if not fn.endswith(CACHE_SUFFIX):
+                        continue
+                    cache_file = os.path.join(dirpath, fn)
+                    image_path = cache_file[: -len(CACHE_SUFFIX)]
+                    if not os.path.exists(image_path):
+                        continue
+                    metas = [_entry_meta(e) for e in _read_entries(image_path)]
+                    metas = [m for m in metas if m.get("id")]
+                    if not metas:
+                        continue  # 不是本插件的缓存文件（普通 json）或还没有有效条目
+                    total_entries += len(metas)
+                    images.append({"path": image_path, "entries": metas})
+                    if len(images) >= MAX_IMAGES:
+                        truncated = True
+                        break
+                if truncated:
+                    break
+            if truncated:
+                break
+        return web.json_response({
+            "images": images,
+            "total_images": len(images),
+            "total_entries": total_entries,
+            "truncated": truncated,
+        })
+
     @PromptServer.instance.routes.get("/qwen3_vqa/batch/scan")
     async def vqa_batch_scan(request):
         """只读预扫描：统计目录里有多少图、多少张已有缓存，不写入任何东西。"""
