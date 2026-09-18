@@ -353,6 +353,19 @@ def _make_entry(entry_id, model, text, output, seed, quantization, attention,
     }
 
 
+def _route_media_path(name: str) -> str:
+    """接口入参兼容：绝对路径直通；相对文件名（老前端可能原样发来，
+    如 "pasted\\image (1).png" 或 "image (25).png"）解析成绝对路径，
+    否则后端会按服务器进程当前目录拼路径而查不到 sidecar。"""
+    name = (name or "").strip()
+    if not name:
+        return ""
+    try:
+        return _resolve_media_path(name)
+    except Exception:
+        return name
+
+
 def _entry_meta(entry: dict) -> dict:
     """列表接口用：不含完整 output，只给下拉/列表需要的信息。"""
     text = " ".join((entry.get("text") or "").split())
@@ -1096,7 +1109,7 @@ class Qwen3_VL_BatchCache:
 if _HAS_SERVER:
     @PromptServer.instance.routes.get("/qwen3_vqa/cache/list")
     async def vqa_cache_list(request):
-        image_path = request.query.get("image_path", "").strip()
+        image_path = _route_media_path(request.query.get("image_path", ""))
         if not image_path:
             return web.json_response({"ids": [], "entries": [], "next_id": None})
         entries = _read_entries(image_path)
@@ -1109,7 +1122,7 @@ if _HAS_SERVER:
 
     @PromptServer.instance.routes.get("/qwen3_vqa/cache/get")
     async def vqa_cache_get(request):
-        image_path = request.query.get("image_path", "").strip()
+        image_path = _route_media_path(request.query.get("image_path", ""))
         entry_id = request.query.get("id", "").strip()
         if not image_path or not entry_id:
             return web.json_response(
@@ -1122,7 +1135,7 @@ if _HAS_SERVER:
 
     @PromptServer.instance.routes.delete("/qwen3_vqa/cache/delete")
     async def vqa_cache_delete(request):
-        image_path = request.query.get("image_path", "").strip()
+        image_path = _route_media_path(request.query.get("image_path", ""))
         entry_id = request.query.get("id", "").strip()
         if not image_path or not entry_id:
             return web.json_response(
