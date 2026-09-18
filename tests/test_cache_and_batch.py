@@ -332,6 +332,10 @@ import inspect as _inspect
 _vi = nodes.Qwen3_VQA()
 chk('VALIDATE_INPUTS 签名含 prompt_version（跳过内置白名单校验的关键）',
     'prompt_version' in _inspect.getfullargspec(nodes.Qwen3_VQA.VALIDATE_INPUTS).args)
+chk('VALIDATE_INPUTS 签名不含 self（v0.34 用类对象直调，会报 missing self）',
+    'self' not in _inspect.getfullargspec(nodes.Qwen3_VQA.VALIDATE_INPUTS).args)
+chk('VALIDATE_INPUTS 可用类对象直调（模拟 execution.py 调用方式）',
+    nodes.Qwen3_VQA.VALIDATE_INPUTS(prompt_version='2026.09.18.001') is True)
 chk('VALIDATE_INPUTS 放行 <new>', _vi.VALIDATE_INPUTS(prompt_version='<new>') is True)
 chk('VALIDATE_INPUTS 放行动态缓存 id', _vi.VALIDATE_INPUTS(prompt_version='2026.09.18.001') is True)
 chk('VALIDATE_INPUTS 拒绝空字符串', _vi.VALIDATE_INPUTS(prompt_version='  ') is not True)
