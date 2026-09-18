@@ -457,13 +457,35 @@ function registerVqaCache(nodeType) {
         // id -> 元信息，用于给下拉生成 "id · 提示词摘要" 这样的标签
         const metaMap = new Map();
 
+        // 函数式 values（动态下拉的标准手段）：前端 ComboWidget 每次点开下拉
+        // 都会调 getValues()，values 是函数就现场调用。返回缓存列表让菜单
+        // 立即显示，同时排队一次异步 refresh，下次打开就是最新数据。
+        // 这样无论路径从哪条路来（连线/手填/外部新增缓存），打开下拉必然是新的。
+        const valuesRef = { list: [NEW_VALUE] };
+        let refreshQueued = false;
+        versionWidget.options.values = () => {
+            if (!refreshQueued) {
+                refreshQueued = true;
+                setTimeout(() => {
+                    refreshQueued = false;
+                    refresh();
+                }, 0);
+            }
+            return valuesRef.list;
+        };
+
+        function applyValues(values) {
+            valuesRef.list.length = 0;
+            for (const v of values) valuesRef.list.push(v);
+        }
+
         function applyLabelMapper() {
             versionWidget.options.getOptionLabel = (value) => labelFor(value, metaMap);
         }
 
         function resetDropdown() {
             metaMap.clear();
-            versionWidget.options.values = [NEW_VALUE];
+            applyValues([NEW_VALUE]);
             applyLabelMapper();
             if (versionWidget.value !== NEW_VALUE) versionWidget.value = NEW_VALUE;
         }
@@ -502,7 +524,7 @@ function registerVqaCache(nodeType) {
                     if (current && current !== NEW_VALUE && !values.includes(current)) {
                         values.push(current);
                     }
-                    versionWidget.options.values = values;
+                    applyValues(values);
                     applyLabelMapper();
                     if (!values.includes(versionWidget.value)) {
                         versionWidget.value = NEW_VALUE;
@@ -527,7 +549,7 @@ function registerVqaCache(nodeType) {
                 if (current && current !== NEW_VALUE && !values.includes(current)) {
                     values.push(current);
                 }
-                versionWidget.options.values = values;
+                applyValues(values);
                 applyLabelMapper();
                 if (!values.includes(versionWidget.value)) {
                     versionWidget.value = NEW_VALUE;
