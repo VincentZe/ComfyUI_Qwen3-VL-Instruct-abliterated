@@ -664,6 +664,15 @@ class Qwen3_VQA:
             "optional": {"image": ("IMAGE",)},
         }
 
+    def VALIDATE_INPUTS(self, prompt_version):
+        # prompt_version 的候选列表由前端扩展按缓存索引动态填充（如 "2026.09.18.001"），
+        # 服务端 INPUT_TYPES 里只有静态的 ["<new>"]。签名里带上 prompt_version
+        # 会让 ComfyUI 跳过内置的 value_not_in_list 校验，改由这里做宽松校验：
+        # 只要是非空字符串就放行（含 "<new>" 与任意缓存 id）。
+        if not isinstance(prompt_version, str) or not prompt_version.strip():
+            return "prompt_version must be a non-empty string"
+        return True
+
     RETURN_TYPES = ("STRING",)
     FUNCTION = "inference"
     CATEGORY = "Comfyui_Qwen3-VL-Instruct"

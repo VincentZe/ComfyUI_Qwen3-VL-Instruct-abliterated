@@ -324,6 +324,19 @@ chk('sage 已在 transformers 侧注册成功', nodes._SAGE_REGISTERED is True)
 chk('两个节点的 attention 选项一致',
     nodes.Qwen3_VL_BatchCache.INPUT_TYPES()['required']['attention'][0] == nodes.ATTENTION_CHOICES)
 
+# prompt_version 的候选列表由前端按缓存索引动态填充，服务端 INPUT_TYPES 里只有 ["<new>"]。
+# ComfyUI 对 combo 输入做 value_not_in_list 白名单校验，除非节点定义了签名里带该输入名的
+# VALIDATE_INPUTS（execution.py: x not in validate_function_inputs 才走内置校验）。
+print('  -- VALIDATE_INPUTS（动态 prompt_version 放行）--')
+import inspect as _inspect
+_vi = nodes.Qwen3_VQA()
+chk('VALIDATE_INPUTS 签名含 prompt_version（跳过内置白名单校验的关键）',
+    'prompt_version' in _inspect.getfullargspec(nodes.Qwen3_VQA.VALIDATE_INPUTS).args)
+chk('VALIDATE_INPUTS 放行 <new>', _vi.VALIDATE_INPUTS(prompt_version='<new>') is True)
+chk('VALIDATE_INPUTS 放行动态缓存 id', _vi.VALIDATE_INPUTS(prompt_version='2026.09.18.001') is True)
+chk('VALIDATE_INPUTS 拒绝空字符串', _vi.VALIDATE_INPUTS(prompt_version='  ') is not True)
+chk('VALIDATE_INPUTS 拒绝非字符串', _vi.VALIDATE_INPUTS(prompt_version=None) is not True)
+
 # 上游 f1061fe 把 model 下拉从硬编码列表改成"动态扫描 models/prompt_generator"。
 # 这里实测 scan_model_choices()：存在目录时只挑名字含 Qwen3-VL 的，不存在时回退内置列表。
 print('  -- scan_model_choices（动态模型下拉）--')
