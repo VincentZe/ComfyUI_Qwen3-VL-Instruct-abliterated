@@ -602,6 +602,56 @@ try:
 except ValueError:
     chk('路径穿越（非绝对）→ 抛 ValueError', True)
 
+# === 9. 内容匹配缓存回退（拖入 input 的拷贝共用原图 sidecar） ===
+_scanned_root = tempfile.mkdtemp(prefix="qvqa_content_")
+_in_dir = os.path.join(_scanned_root, "input")
+os.makedirs(os.path.join(_in_dir, "pasted"), exist_ok=True)
+nodes.folder_paths.get_directory = lambda name: _in_dir
+nodes._SIDE_INDEX["built"] = 0.0
+nodes._FALLBACK_MEMO.clear()
+
+# 原图 + sidecar 在 input/pasted 下（真实场景：批量图在 input/pasted）
+_orig_img = os.path.join(_in_dir, "pasted", "photo.jpg")
+_orig_bytes = b"JPEGDATA-same-content-0123456789"
+with open(_orig_img, "wb") as f:
+    f.write(_orig_bytes)
+with open(_orig_img + nodes.CACHE_SUFFIX, "w", encoding="utf-8") as f:
+    f.write(json.dumps({"id": "20260101.001", "text": "orig prompt"}) + "\n")
+
+# 拖入拷贝：input 根目录、同名同内容（ComfyUI 上传行为）
+_copy_img = os.path.join(_in_dir, "photo.jpg")
+with open(_copy_img, "wb") as f:
+    f.write(_orig_bytes)
+
+_chk = nodes._read_entries(_copy_img)
+chk('input 拷贝按内容回退 → 读到原图缓存条目',
+    len(_chk) == 1 and _chk[0]["id"] == "20260101.001")
+chk('  └ 拷贝旁边确实没有 sidecar（不是走精确路径）',
+    not os.path.exists(_copy_img + nodes.CACHE_SUFFIX))
+
+nodes._append_entry(_copy_img, {"id": "20260101.002", "text": "from copy"})
+_orig_lines = [json.loads(l) for l in
+               open(_orig_img + nodes.CACHE_SUFFIX, encoding="utf-8") if l.strip()]
+chk('通过拷贝路径写入 → 归并到原图 sidecar',
+    [e["id"] for e in _orig_lines] == ["20260101.001", "20260101.002"])
+chk('  └ 拷贝路径旁仍无第二份 sidecar',
+    not os.path.exists(_copy_img + nodes.CACHE_SUFFIX))
+
+chk('通过拷贝路径删除 → 生效于原图 sidecar',
+    nodes._delete_entry(_copy_img, "20260101.002")
+    and [e["id"] for e in nodes._read_entries(_copy_img)] == ["20260101.001"])
+
+# 同名但内容不同 → 不许误匹配
+_other_img = os.path.join(_in_dir, "photo.jpg")
+with open(_other_img, "wb") as f:
+    f.write(b"DIFFERENT-content-bytes")
+os.rename(_other_img, os.path.join(_in_dir, "other.jpg"))
+chk('内容不同的同名图 → 不误匹配（读到空）',
+    nodes._read_entries(os.path.join(_in_dir, "other.jpg")) == [])
+
+nodes._SIDE_INDEX["built"] = 0.0   # 允许后续用例重建索引
+shutil.rmtree(_scanned_root, ignore_errors=True)
+
 # 收尾：还原 models_dir 并清掉临时目录
 _fp.models_dir = _old_models_dir
 shutil.rmtree(_models_root, ignore_errors=True)

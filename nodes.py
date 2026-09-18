@@ -1,7 +1,9 @@
 import os
 import json
 import datetime
+import hashlib
 import threading
+import time
 import weakref
 import torch
 import folder_paths
@@ -118,9 +120,112 @@ def _resolve_media_path(name: str) -> str:
     return folder_paths.get_annotated_filepath(name)
 
 
+# ---------------- 内容匹配缓存回退（A 方案） ----------------
+# 拖图进 Load Image Advanced 会被核心前端拷贝进 input，image_path 变成
+# 拷贝路径，而缓存 sidecar 写在原图旁边，按路径查不到。Desktop 2 的
+# Electron 40 页面拿不到拖入文件的原始路径（File.path 已移除、
+# __comfyDesktop2 桥无 getPathForFile），无法直用原路径——所以在后端
+# 按「文件内容一致」回退：当前路径没有 sidecar 时，找内容相同且旁边
+# 有 sidecar 的原图，共用其缓存（读写都归并到原图 sidecar，不产生第二份）。
+
+_SIG_CACHE = {}          # (path, size, mtime) -> (size, sha256)
+_IDX_LOCK = threading.Lock()
+_SIDE_INDEX = {"built": 0.0, "by_sig": {}}   # sig -> 有 sidecar 的图片路径
+_FALLBACK_MEMO = {}      # image_path -> (other, ocf)，避免每次调用都打印
+
+
+def _file_signature(path: str):
+    """(size, sha256)。大文件只哈希头尾各 1MB——判重足够且快；结果缓存。"""
+    try:
+        st = os.stat(path)
+    except OSError:
+        return None
+    key = (path, st.st_size, st.st_mtime)
+    hit = _SIG_CACHE.get(key)
+    if hit is not None:
+        return hit
+    h = hashlib.sha256()
+    try:
+        with open(path, "rb") as f:
+            h.update(f.read(1024 * 1024))            # 头 1MB
+            if st.st_size > 2 * 1024 * 1024:
+                f.seek(-1024 * 1024, os.SEEK_END)    # 尾 1MB
+                h.update(f.read())
+            elif st.st_size > 1024 * 1024:
+                h.update(f.read())
+    except OSError:
+        return None
+    sig = (st.st_size, h.hexdigest())
+    if len(_SIG_CACHE) > 4096:
+        _SIG_CACHE.clear()
+    _SIG_CACHE[key] = sig
+    return sig
+
+
+def _same_content_sidecar_image(image_path: str, extra_root: str = ""):
+    """找内容一致、旁边有 sidecar 的其它图片路径；找不到返回 None。"""
+    sig = _file_signature(image_path)
+    if sig is None:
+        return None
+    with _IDX_LOCK:
+        if time.monotonic() - _SIDE_INDEX["built"] > 30:
+            by_sig = {}
+            roots = []
+            try:
+                roots.append(folder_paths.get_directory("input"))
+            except Exception:
+                pass
+            try:
+                roots.append(folder_paths.get_directory("output"))
+            except Exception:
+                pass
+            if extra_root and os.path.isdir(extra_root):
+                roots.append(extra_root)
+            for root in roots:
+                if not root or not os.path.isdir(root):
+                    continue
+                for dirpath, _dirs, files in os.walk(root):
+                    for fn in files:
+                        if not fn.endswith(CACHE_SUFFIX):
+                            continue
+                        img = os.path.join(dirpath, fn[: -len(CACHE_SUFFIX)])
+                        s = _file_signature(img)
+                        if s is not None and s not in by_sig:
+                            by_sig[s] = img
+            _SIDE_INDEX["by_sig"] = by_sig
+            _SIDE_INDEX["built"] = time.monotonic()
+        return _SIDE_INDEX["by_sig"].get(sig)
+
+
+def _effective_cache_file(image_path: str) -> str:
+    """读/写缓存真正落点：本地 sidecar 优先，否则回退到内容一致原图的 sidecar。"""
+    cf = _cache_file_for(image_path)
+    if os.path.exists(cf):
+        return cf
+    try:
+        other = _same_content_sidecar_image(
+            image_path, extra_root=os.path.dirname(image_path) or ""
+        )
+    except Exception as e:
+        print(f"[Qwen3_VQA] 缓存回退查找失败（忽略）：{e!r}")
+        return cf
+    if other and os.path.normcase(other) != os.path.normcase(image_path):
+        ocf = _cache_file_for(other)
+        if os.path.exists(ocf):
+            memo = _FALLBACK_MEMO.get(image_path)
+            if memo != (other, ocf):
+                _FALLBACK_MEMO[image_path] = (other, ocf)
+                print(
+                    f"[Qwen3_VQA] {image_path} 旁边没有缓存，"
+                    f"但内容与 {other} 一致，共用其缓存 sidecar"
+                )
+            return ocf
+    return cf
+
+
 def _next_id(image_path: str) -> str:
     today = datetime.datetime.now().strftime(ID_DATE_FMT)
-    cache_file = _cache_file_for(image_path)
+    cache_file = _effective_cache_file(image_path)
     max_n = 0
     if os.path.exists(cache_file):
         with open(cache_file, "r", encoding="utf-8") as f:
@@ -144,7 +249,7 @@ def _next_id(image_path: str) -> str:
 
 
 def _read_entries(image_path: str):
-    cache_file = _cache_file_for(image_path)
+    cache_file = _effective_cache_file(image_path)
     entries = []
     if not os.path.exists(cache_file):
         return entries
@@ -169,7 +274,7 @@ def _find_entry(image_path: str, entry_id: str):
 
 
 def _append_entry(image_path: str, entry: dict):
-    cache_file = _cache_file_for(image_path)
+    cache_file = _effective_cache_file(image_path)
     with _CACHE_LOCK:
         with open(cache_file, "a", encoding="utf-8") as f:
             f.write(json.dumps(entry, ensure_ascii=False) + "\n")
@@ -177,7 +282,7 @@ def _append_entry(image_path: str, entry: dict):
 
 def _delete_entry(image_path: str, entry_id: str) -> bool:
     """从缓存文件中移除指定 id 的那一行；其余内容（含无法解析的行）原样保留。"""
-    cache_file = _cache_file_for(image_path)
+    cache_file = _effective_cache_file(image_path)
     if not os.path.exists(cache_file):
         return False
     with _CACHE_LOCK:
