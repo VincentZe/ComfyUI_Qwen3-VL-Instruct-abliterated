@@ -53,7 +53,19 @@ function clip(text, max = 28) {
 async function resolveImagePath(node) {
     const pathWidget = node.widgets?.find((w) => w.name === "image_path");
     const manual = String(pathWidget?.value || "").trim();
-    if (manual) return manual;
+    if (manual) {
+        // 绝对路径直接用；相对文件名（如 pasted\image (1).png）交给后端解析
+        if (/^([a-zA-Z]:[\\/]|\\\\|\/)/.test(manual)) return manual;
+        try {
+            const data = await fetchJson(
+                `/qwen3_vqa/resolve_path?name=${enc(manual)}`
+            );
+            if (data.path) return String(data.path);
+        } catch (e) {
+            console.warn("[Qwen3_VQA] resolve manual path failed", e);
+        }
+        return manual;
+    }
 
     let input = node.inputs?.find((i) => i && i.name === "image_path");
     for (let hops = 0; hops < 10 && input; hops++) {
@@ -490,6 +502,36 @@ function registerVqaCache(nodeType) {
             if (versionWidget.value !== NEW_VALUE) versionWidget.value = NEW_VALUE;
         }
 
+        // 全量索引兜底：路径解析不出来，或解析出来但这张图没有任何缓存条目。
+        // 选项标签带所属图片名；若 image_path 还是自由控件（没连线、没手填），
+        // 选中某条时会顺手把它的图片路径填进去。
+        async function fillFromIndex() {
+            try {
+                const data = await CacheAPI.index();
+                metaMap.clear();
+                const values = [NEW_VALUE];
+                for (const img of data.images || []) {
+                    for (const meta of img.entries || []) {
+                        if (!meta.id || metaMap.has(meta.id)) continue;
+                        metaMap.set(meta.id, { ...meta, image: img.path });
+                        values.push(meta.id);
+                    }
+                }
+                const current = versionWidget.value;
+                if (current && current !== NEW_VALUE && !values.includes(current)) {
+                    values.push(current);
+                }
+                applyValues(values);
+                applyLabelMapper();
+                if (!values.includes(versionWidget.value)) {
+                    versionWidget.value = NEW_VALUE;
+                }
+            } catch (e) {
+                console.warn("[Qwen3_VQA] cache index fetch failed", e);
+                resetDropdown();
+            }
+        }
+
         const refresh = async () => {
             if (!useCacheWidget?.value) {
                 resetDropdown();
@@ -507,42 +549,23 @@ function registerVqaCache(nodeType) {
             if (!imagePath) {
                 // 路径解析不出来（未知上游类型 / 连线刚拉上 / 没连）→
                 // 兜底走后端全量缓存索引，不运行工作流也有选项可选。
-                // 选项标签带所属图片名；若 image_path 还是自由控件（没连线、
-                // 没手填），选中某条时会顺手把它的图片路径填进去。
-                try {
-                    const data = await CacheAPI.index();
-                    metaMap.clear();
-                    const values = [NEW_VALUE];
-                    for (const img of data.images || []) {
-                        for (const meta of img.entries || []) {
-                            if (!meta.id || metaMap.has(meta.id)) continue;
-                            metaMap.set(meta.id, { ...meta, image: img.path });
-                            values.push(meta.id);
-                        }
-                    }
-                    const current = versionWidget.value;
-                    if (current && current !== NEW_VALUE && !values.includes(current)) {
-                        values.push(current);
-                    }
-                    applyValues(values);
-                    applyLabelMapper();
-                    if (!values.includes(versionWidget.value)) {
-                        versionWidget.value = NEW_VALUE;
-                    }
-                } catch (e) {
-                    console.warn("[Qwen3_VQA] cache index fetch failed", e);
-                    resetDropdown();
-                }
+                await fillFromIndex();
                 return;
             }
 
             try {
                 const data = await CacheAPI.list(imagePath);
+                const ids = (data.ids || []).filter(Boolean);
+                if (!ids.length) {
+                    // 这张图本地没有缓存条目（比如拖入的拷贝、sidecar 在别处）
+                    // → 也走全量索引兜底，让下拉栏始终有内容可选
+                    await fillFromIndex();
+                    return;
+                }
                 metaMap.clear();
                 for (const meta of data.entries || []) {
                     if (meta.id) metaMap.set(meta.id, meta);
                 }
-                const ids = (data.ids || []).filter(Boolean);
                 const values = [NEW_VALUE, ...ids];
                 // 当前值不在列表里也保留（比如换了图 / json 被移走），不做静默替换
                 const current = versionWidget.value;

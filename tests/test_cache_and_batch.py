@@ -652,6 +652,40 @@ chk('内容不同的同名图 → 不误匹配（读到空）',
 nodes._SIDE_INDEX["built"] = 0.0   # 允许后续用例重建索引
 shutil.rmtree(_scanned_root, ignore_errors=True)
 
+# === 9.5 v0.34+ 兼容：folder_paths.get_directory 被移除，只剩 get_input_directory ===
+_v34_root = tempfile.mkdtemp(prefix="qvqa_v34_")
+_v34_in = os.path.join(_v34_root, "input")
+os.makedirs(os.path.join(_v34_in, "pasted"), exist_ok=True)
+del nodes.folder_paths.get_directory          # 模拟 v0.34：没有 get_directory 了
+nodes.folder_paths.get_input_directory = lambda: _v34_in
+nodes.folder_paths.get_output_directory = lambda: os.path.join(_v34_root, "output")
+
+_v34_orig = os.path.join(_v34_in, "pasted", "photo.jpg")
+with open(_v34_orig, "wb") as f:
+    f.write(b"V34SAMECONTENT-0123456789")
+with open(_v34_orig + nodes.CACHE_SUFFIX, "w", encoding="utf-8") as f:
+    f.write(json.dumps({"id": "20260101.001", "text": "v34 prompt"}) + "\n")
+_v34_copy = os.path.join(_v34_in, "photo.jpg")
+with open(_v34_copy, "wb") as f:
+    f.write(b"V34SAMECONTENT-0123456789")
+
+nodes._SIDE_INDEX["built"] = 0.0
+nodes._FALLBACK_MEMO.clear()
+_v34_entries = nodes._read_entries(_v34_copy)
+chk('v0.34（无 get_directory）→ 内容匹配仍能找到 input 根下的 sidecar',
+    len(_v34_entries) == 1 and _v34_entries[0]["id"] == "20260101.001")
+
+# index 接口在新 API 下也应返回该图
+async def _main_v34():
+    r = await REG[('GET', '/qwen3_vqa/cache/index')](_Req())
+    paths = [i['path'] for i in r.payload['images']]
+    chk('v0.34 index 接口扫到 input 根下的 sidecar',
+        r.payload['total_images'] >= 1 and os.path.join(_v34_in, 'pasted', 'photo.jpg') in paths,
+        json.dumps(r.payload['total_images']))
+asyncio.run(_main_v34())
+
+shutil.rmtree(_v34_root, ignore_errors=True)
+
 # 收尾：还原 models_dir 并清掉临时目录
 _fp.models_dir = _old_models_dir
 shutil.rmtree(_models_root, ignore_errors=True)

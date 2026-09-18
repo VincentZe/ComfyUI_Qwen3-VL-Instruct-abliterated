@@ -120,6 +120,35 @@ def _resolve_media_path(name: str) -> str:
     return folder_paths.get_annotated_filepath(name)
 
 
+def _fs_root(kind: str) -> str:
+    """取 input/output 根目录，兼容新旧 ComfyUI。
+
+    v0.34 起 folder_paths.get_directory(kind) 被移除，换成
+    get_input_directory() / get_output_directory()；老版本只有
+    get_directory(kind)。两个都没有时再试 get_directory_by_type(kind)。
+    全部不可用返回空串（调用方自行跳过）。
+    """
+    getter = getattr(folder_paths, "get_%s_directory" % kind, None)
+    if callable(getter):
+        try:
+            return getter() or ""
+        except Exception:
+            pass
+    legacy = getattr(folder_paths, "get_directory", None)
+    if callable(legacy):
+        try:
+            return legacy(kind) or ""
+        except Exception:
+            pass
+    by_type = getattr(folder_paths, "get_directory_by_type", None)
+    if callable(by_type):
+        try:
+            return by_type(kind) or ""
+        except Exception:
+            pass
+    return ""
+
+
 # ---------------- 内容匹配缓存回退（A 方案） ----------------
 # 拖图进 Load Image Advanced 会被核心前端拷贝进 input，image_path 变成
 # 拷贝路径，而缓存 sidecar 写在原图旁边，按路径查不到。Desktop 2 的
@@ -170,15 +199,7 @@ def _same_content_sidecar_image(image_path: str, extra_root: str = ""):
     with _IDX_LOCK:
         if time.monotonic() - _SIDE_INDEX["built"] > 30:
             by_sig = {}
-            roots = []
-            try:
-                roots.append(folder_paths.get_directory("input"))
-            except Exception:
-                pass
-            try:
-                roots.append(folder_paths.get_directory("output"))
-            except Exception:
-                pass
+            roots = [r for r in (_fs_root("input"), _fs_root("output")) if r]
             if extra_root and os.path.isdir(extra_root):
                 roots.append(extra_root)
             for root in roots:
@@ -1141,11 +1162,9 @@ if _HAS_SERVER:
         """
         roots_param = request.query.get("roots", "").strip()
         roots = [r.strip() for r in roots_param.split(";") if r.strip()]
-        try:
-            roots.insert(0, folder_paths.get_directory("input"))
-            roots.append(folder_paths.get_directory("output"))
-        except Exception:
-            pass
+        for default_root in (_fs_root("input"), _fs_root("output")):
+            if default_root:
+                roots.append(default_root)
         seen = set()
         images = []
         total_entries = 0
