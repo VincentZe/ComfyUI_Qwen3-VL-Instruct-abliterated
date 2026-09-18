@@ -438,6 +438,64 @@ class _InterruptCheckCriteria:
 _InterruptExc = getattr(comfy.model_management, "InterruptProcessingException", None)
 
 
+def _free_cuda_cache() -> None:
+    if torch.cuda.is_available():
+        try:
+            torch.cuda.empty_cache()
+            torch.cuda.ipc_collect()
+        except Exception:
+            pass
+
+
+def _run_model_load(load_fn, load_lock, poll_interval: float = 0.5):
+    """在后台线程执行 from_pretrained 这类无法中途终止的长调用，
+    主线程轮询 ComfyUI 中断标志，让「加载模型」阶段也能响应中断。
+
+    - 正常完成：返回 load_fn() 的结果。
+    - 加载中检测到中断：立即打印提示并抛出 InterruptProcessingException。
+      后台线程杀不掉，标记为孤儿——等它把模型加载完后自动丢弃模型、
+      释放显存，并释放 load_lock。同一实例的下一次加载会先在
+      load_lock 上等孤儿结束（避免两份模型同时占显存），再重新加载。
+    - load_fn 自己抛的异常原样传播。
+    """
+    slot = {}
+    done = threading.Event()
+    abandoned = [False]
+
+    def _work():
+        try:
+            slot["result"] = load_fn()
+        except BaseException as e:  # 原样转交主线程（含 KeyboardInterrupt 等）
+            slot["error"] = e
+        finally:
+            if abandoned[0] and "result" in slot:
+                print("[Qwen3_VQA] 被中断的模型加载已完成，释放孤儿模型显存")
+                del slot["result"]
+                _free_cuda_cache()
+            done.set()
+            load_lock.release()
+
+    load_lock.acquire()  # 上一个孤儿还没加载完时，在这里等它结束
+    thread = threading.Thread(target=_work, daemon=True, name="qwen3-vqa-model-load")
+    thread.start()
+    while not done.wait(poll_interval):
+        if _InterruptExc is not None:
+            try:
+                comfy.model_management.throw_exception_if_processing_interrupted()
+            except _InterruptExc:
+                abandoned[0] = True
+                print(
+                    "[Qwen3_VQA] 检测到中断：模型加载无法中途终止，"
+                    "等待加载完成后立即停止并释放模型"
+                )
+                raise
+            except Exception:
+                pass  # 独立环境没有 comfy 的中断标志，继续轮询到加载结束
+    if "error" in slot:
+        raise slot["error"]
+    return slot["result"]
+
+
 def _release_runner(runner) -> None:
     """批量跑完后统一释放模型/处理器显存。"""
     try:
@@ -545,6 +603,9 @@ class Qwen3_VQA:
         self.current_attention = None
         self.current_min_pixels = None
         self.current_max_pixels = None
+        # 加载互斥锁：被中断的加载（孤儿线程）结束前，下一次加载在这里等待，
+        # 避免孤儿模型和重载模型同时占显存。
+        self._load_lock = threading.Lock()
 
     def release_model(self, reason: str = "", offload: bool = False) -> bool:
         """释放/让位模型。offload=True 时优先整托管进内存（更快回归）。
@@ -699,6 +760,12 @@ class Qwen3_VQA:
     ):
         # 注意：下面第 300 行左右会用 apply_chat_template 的结果覆盖 text，这里先把提示词原文留一份
         user_text = text
+        # 开跑先查一次中断：排队时按了取消的话，进节点瞬间就停，
+        # 不用等 snapshot_download / 模型加载这些长调用。
+        try:
+            comfy.model_management.throw_exception_if_processing_interrupted()
+        except Exception:
+            pass  # 独立环境没有 comfy；真中断（BaseException）会正常向上抛
         # image_path 是合并后的唯一媒体路径输入，同时兼任提示词缓存键：
         #   - str：Load Image Advanced / VideoLoader 的 path 输出，或手填的绝对路径；
         #   - list：MultiplePathsInput 的 content dict 列表（单条时取其中的路径当键，
@@ -808,13 +875,18 @@ class Qwen3_VQA:
                 _estimate_model_bytes(self.model_checkpoint, quantization), "加载模型"
             )
 
-            self.model = Qwen3VLForConditionalGeneration.from_pretrained(
-                self.model_checkpoint,
-                dtype=torch.bfloat16 if self.bf16_support else torch.float16,
-                device_map="auto",
-                attn_implementation=attention,
-                quantization_config=quantization_config,
-            )
+            def _load_model():
+                return Qwen3VLForConditionalGeneration.from_pretrained(
+                    self.model_checkpoint,
+                    dtype=torch.bfloat16 if self.bf16_support else torch.float16,
+                    device_map="auto",
+                    attn_implementation=attention,
+                    quantization_config=quantization_config,
+                )
+
+            # 后台线程加载 + 主线程轮询中断：加载阶段（通常是十几秒到一分钟）
+            # 也能响应中断。中断时立即抛出，孤儿线程加载完后自行释放显存。
+            self.model = _run_model_load(_load_model, self._load_lock)
             self._offloaded = False
             # device_map="auto" 按加载瞬间的空闲显存切分：显存不够就把语言层
             # offload 到 CPU，推理慢一个数量级。这里明确报出来，别让用户从

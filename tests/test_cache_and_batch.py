@@ -703,6 +703,99 @@ asyncio.run(_main_v34())
 
 shutil.rmtree(_v34_root, ignore_errors=True)
 
+# =========================== 10. 可中断模型加载 _run_model_load
+print('\n=== 10. 可中断模型加载 _run_model_load ===')
+import threading as _threading
+
+mm.interrupt_current_processing(False)
+
+# 10.1 正常完成
+_lk1 = _threading.Lock()
+chk('加载正常完成返回结果', nodes._run_model_load(lambda: 'MODEL', _lk1) == 'MODEL')
+chk('正常完成后锁已释放', _lk1.acquire(timeout=2) and (_lk1.release() or True))
+
+# 10.2 加载中中断：立即抛 InterruptProcessingException；孤儿加载完后自动释放并解锁
+_slow_done = _threading.Event()
+_lk2 = _threading.Lock()
+
+
+def _slow_load():
+    _slow_done.wait(5)
+    return {'model': 'orphan'}
+
+
+_timer = _threading.Timer(0.3, lambda: mm.interrupt_current_processing(True))
+_timer.start()
+_raised = None
+try:
+    nodes._run_model_load(_slow_load, _lk2)
+except BaseException as e:
+    _raised = e
+_timer.join()
+chk('加载中检测到中断立即抛 InterruptProcessingException',
+    isinstance(_raised, _InterruptProcessingException), repr(_raised))
+_slow_done.set()
+chk('孤儿加载结束后 load_lock 被释放（下次加载可继续）',
+    _lk2.acquire(timeout=5) and (_lk2.release() or True))
+
+# 10.3 中断后的孤儿模型不被实例引用（slot 丢弃 → 可被 GC）
+import weakref as _weakref
+
+
+class _Orphan:
+    pass
+
+
+_orphan_done = _threading.Event()
+_orphan_holder = {}
+
+
+def _orphan_load():
+    _orphan_done.wait(5)
+    return _Orphan()
+
+
+_orphan_holder['obj'] = _Orphan()
+_wref = _weakref.ref(_orphan_holder['obj'])
+_lk3 = _threading.Lock()
+mm.interrupt_current_processing(False)
+_timer2 = _threading.Timer(0.3, lambda: mm.interrupt_current_processing(True))
+_timer2.start()
+try:
+    nodes._run_model_load(_orphan_load, _lk3)
+except BaseException:
+    pass
+_timer2.join()
+_orphan_done.set()
+_orphan_holder.clear()
+_orphan_done.wait(0.2)  # 给孤儿线程一点时间走 finally
+import gc as _gc
+_gc.collect()
+chk('孤儿加载的模型在线程结束后可被回收', _wref() is None)
+chk('孤儿结束后锁再次可用', _lk3.acquire(timeout=5) and (_lk3.release() or True))
+
+# 10.4 load_fn 自身异常原样传播
+mm.interrupt_current_processing(False)
+
+
+def _bad_load():
+    raise ValueError('boom')
+
+
+_lk4 = _threading.Lock()
+_raised4 = None
+try:
+    nodes._run_model_load(_bad_load, _lk4)
+except ValueError as e:
+    _raised4 = e
+chk('load_fn 的异常原样传播', _raised4 is not None and str(_raised4) == 'boom')
+chk('异常后锁同样被释放', _lk4.acquire(timeout=2) and (_lk4.release() or True))
+
+# 10.5 实例有 _load_lock（加载互斥的字段）
+chk('Qwen3_VQA 实例带 _load_lock', isinstance(nodes.Qwen3_VQA()._load_lock, type(_threading.Lock())))
+
+mm.interrupt_current_processing(False)
+
 # 收尾：还原 models_dir 并清掉临时目录
 _fp.models_dir = _old_models_dir
 shutil.rmtree(_models_root, ignore_errors=True)
