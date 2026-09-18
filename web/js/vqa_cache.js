@@ -1,4 +1,4 @@
-import { app } from "../../scripts/app.js";
+import { app } from "/scripts/app.js";
 
 const NODE_NAME = "Qwen3_VQA";
 const BATCH_NODE_NAME = "Qwen3_VL_BatchCache";

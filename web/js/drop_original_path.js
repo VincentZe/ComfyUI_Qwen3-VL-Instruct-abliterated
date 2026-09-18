@@ -12,7 +12,7 @@
 // 通过 Desktop(Electron) 的 window.api.getPathForFile（preload 里的
 // webUtils.getPathForFile）拿到原始绝对路径，直接填进控件。
 // 拿不到原始路径的环境（普通浏览器）返回 false，自动回落到核心上传。
-import { app } from "../../scripts/app.js";
+import { app } from "/scripts/app.js";
 
 const TARGET_TYPES = new Set(["ImageLoader", "VideoLoader", "VideoLoaderPath"]);
 const MEDIA_EXT_RE = /\.(jpe?g|png|bmp|tiff|webp|gif|mp4|mkv|mov|avi|flv|wmv|webm|m4v)$/i;
