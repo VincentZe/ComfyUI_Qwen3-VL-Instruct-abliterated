@@ -570,6 +570,38 @@ _inst75d.release_model('测试混合设备', offload=True)
 chk('混合设备 hf_device_map 让位 → 退回彻底释放',
     _inst75d.model is None and _inst75d._offloaded is False)
 
+# === 8. _resolve_media_path：绝对路径直通（拖拽原始路径场景） ===
+# 给桩补一个仿真实语义的 get_annotated_filepath（拒绝穿越、join 到临时目录）
+def _fake_get_annotated(name, default_dir=None):
+    base = tempfile.gettempdir()
+    p = os.path.abspath(os.path.join(base, name))
+    if not p.startswith(os.path.abspath(base)):
+        raise ValueError("Invalid file path: {!r}".format(name))
+    return p
+
+nodes.folder_paths.get_annotated_filepath = _fake_get_annotated
+
+_abs_win = r"C:\somewhere\else\pic.jpg"
+chk('绝对路径 → 原样直通（abspath）',
+    nodes._resolve_media_path(_abs_win) == os.path.abspath(_abs_win))
+chk('  └ 不存在的绝对路径也不抛异常（VALIDATE 用 os.path.exists 判断）',
+    nodes._resolve_media_path(_abs_win) == os.path.abspath(_abs_win))
+chk('UNC 路径 → 直通',
+    nodes._resolve_media_path(r"\\server\share\v.mp4") == os.path.abspath(r"\\server\share\v.mp4"))
+chk('带空白的绝对路径 → strip 后直通',
+    nodes._resolve_media_path("  " + _abs_win + "  ") == os.path.abspath(_abs_win))
+try:
+    _rel = nodes._resolve_media_path("foo.jpg")
+    chk('相对文件名 → 交给 folder_paths（fallback 到 input 目录）',
+        _rel.endswith("foo.jpg"))
+except ValueError:
+    chk('相对文件名 → 交给 folder_paths（fallback 到 input 目录）', True)
+try:
+    nodes._resolve_media_path(r"..\..\outside.jpg")
+    chk('路径穿越（非绝对）→ 抛 ValueError', False)
+except ValueError:
+    chk('路径穿越（非绝对）→ 抛 ValueError', True)
+
 # 收尾：还原 models_dir 并清掉临时目录
 _fp.models_dir = _old_models_dir
 shutil.rmtree(_models_root, ignore_errors=True)

@@ -101,6 +101,23 @@ def _cache_file_for(image_path: str) -> str:
     return image_path + CACHE_SUFFIX
 
 
+def _resolve_media_path(name: str) -> str:
+    """解析媒体路径：绝对路径直通，其余走 ComfyUI 注解解析。
+
+    与 util_nodes._resolve_media_path 同实现（无法安全互相 import：
+    ComfyUI 核心也有顶层 nodes.py 模块，import 名字有歧义），保持一致。
+    """
+    name = (name or "").strip()
+    is_abs = (
+        (len(name) >= 2 and name[1] == ":")
+        or name.startswith("\\\\")
+        or name.startswith("/")
+    )
+    if is_abs:
+        return os.path.abspath(name)
+    return folder_paths.get_annotated_filepath(name)
+
+
 def _next_id(image_path: str) -> str:
     today = datetime.datetime.now().strftime(ID_DATE_FMT)
     cache_file = _cache_file_for(image_path)
@@ -1002,7 +1019,11 @@ if _HAS_SERVER:
         name = request.query.get("name", "").strip()
         if not name:
             return web.json_response({"error": "name is required"}, status=400)
-        return web.json_response({"path": folder_paths.get_annotated_filepath(name)})
+        try:
+            path = _resolve_media_path(name)
+        except ValueError as e:
+            return web.json_response({"error": str(e)}, status=400)
+        return web.json_response({"path": path})
 
     @PromptServer.instance.routes.get("/qwen3_vqa/cache/index")
     async def vqa_cache_index(request):
